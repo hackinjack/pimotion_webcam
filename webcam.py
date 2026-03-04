@@ -281,10 +281,12 @@ def config():
 
 
 if __name__ == '__main__':
-    logger.info("PiCam Motion Webcam starting on http://0.0.0.0:5000")
+    logger.info("PiCam Motion Webcam (Gevent mode) starting on http://0.0.0.0:5000")
     logger.info("Tune MOTION_THRESHOLD if needed (lower = more sensitive)")
+
     try:
         app.run(host='0.0.0.0', port=5000, threaded=True)
     finally:
         camera.stop()
+
 
