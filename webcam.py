@@ -5,7 +5,7 @@ gevent.monkey.patch_all()
 from flask import Flask, Response, render_template_string, send_from_directory, request
 import picamera2
 from picamera2.encoders import JpegEncoder
-from picamera2.outputs import FileOutput  # FileOutput is used for BOTH files and memory streams
+from picamera2.outputs import FileOutput
 import io
 from threading import Condition, Lock
 import threading
@@ -33,16 +33,33 @@ os.makedirs(RECORDING_DIR, exist_ok=True)
 
 # ----------------------------------------------------------------------
 # 1. Thread-safe Streaming Output Class
+# Parses raw chunked file bytes into valid JPEG frames
 # ----------------------------------------------------------------------
 class StreamingBuffer(io.BufferedIOBase):
     def __init__(self):
         self.frame = None
         self.condition = Condition()
+        self.buffer = io.BytesIO()
 
     def write(self, buf):
-        with self.condition:
-            self.frame = buf
-            self.condition.notify_all()
+        # Check if this chunk is the start of a new JPEG image
+        if buf.startswith(b'\xff\xd8'):
+            # It's a new frame! Save the old buffer as a complete frame
+            self.buffer.seek(0)
+            completed_frame = self.buffer.read()
+            
+            # Reset buffer for the new frame
+            self.buffer.seek(0)
+            self.buffer.truncate()
+            
+            # Notify clients that a complete frame is ready
+            if len(completed_frame) > 0:
+                with self.condition:
+                    self.frame = completed_frame
+                    self.condition.notify_all()
+                    
+        # Append the new chunk to the current buffer
+        self.buffer.write(buf)
         return len(buf)
 
 # Initialize the global streaming buffer
@@ -55,8 +72,6 @@ camera = picamera2.Picamera2()
 config = camera.create_video_configuration(main={"size": (1280, 720)})
 camera.configure(config)
 
-# Fix: Wrap the memory stream buffer inside FileOutput
-# (Picamera2 expects ALL outputs to inherit from its base Output class)
 camera.start_recording(JpegEncoder(), FileOutput(stream_buffer))
 camera.start()
 
@@ -85,7 +100,6 @@ def start_recording():
     output = FfmpegOutput(filename)
     encoder = H264Encoder(bitrate=VIDEO_BITRATE) 
     
-    # We use start_encoder alongside the already-running JpegEncoder
     camera.start_encoder(encoder, output)
     logger.info(f"[MOTION] Recording MP4 started: {filename}")
     time.sleep(clip_length)
@@ -97,9 +111,8 @@ def motion_worker():
     """Background thread that constantly checks for motion."""
     global prev_gray
     while True:
-        # Instead of putting load on the camera with capture_array(),
-        # we just grab the JPEG that is already being generated for the web stream.
         with stream_buffer.condition:
+            # Wait for a fully completed JPEG frame
             stream_buffer.condition.wait(timeout=1.0)
             jpeg_bytes = stream_buffer.frame
             
@@ -135,6 +148,8 @@ def motion_worker():
             logger.error(f"Motion processing error: {e}")
             
         time.sleep(0.2)  # Throttle to ~5fps for motion analysis to save CPU
+
+threading.Thread(target=motion_worker, daemon=True).start()
 
 # ----------------------------------------------------------------------
 # 4. Flask Web Routes
@@ -330,7 +345,6 @@ if __name__ == '__main__':
 
     server = WSGIServer(('0.0.0.0', 5000), app)
 
-    # Graceful shutdown handler
     def shutdown():
         logger.info("Shutting down... releasing camera.")
         server.stop()
@@ -340,7 +354,6 @@ if __name__ == '__main__':
         except Exception as e:
             logger.error(f"Error closing camera: {e}")
 
-    # Catch systemd stop/restart signals
     gevent.signal_handler(signal.SIGTERM, shutdown)
     gevent.signal_handler(signal.SIGINT, shutdown)
 
