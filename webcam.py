@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
+import gevent.monkey
+gevent.monkey.patch_all()
+
 from flask import Flask, Response, render_template_string, send_from_directory, request
 import picamera2
-from picamera2.encoders import MJPEGEncoder
-import cv2
-import numpy as np
-from threading import Lock
+from picamera2.encoders import JpegEncoder
+from picamera2.outputs import FileOutput  # FileOutput is used for BOTH files and memory streams
+import io
+from threading import Condition, Lock
+import threading
 import time
 import os
-import threading
-
+import cv2
+import numpy as np
 import logging
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
-
-
 
 app = Flask(__name__)
 
@@ -26,16 +29,40 @@ RECORDING_DIR = '/home/jfk/videos'
 
 # Web config state (thread-safe)
 config_lock = Lock()
-
 os.makedirs(RECORDING_DIR, exist_ok=True)
 
-# Camera setup
+# ----------------------------------------------------------------------
+# 1. Thread-safe Streaming Output Class
+# ----------------------------------------------------------------------
+class StreamingBuffer(io.BufferedIOBase):
+    def __init__(self):
+        self.frame = None
+        self.condition = Condition()
+
+    def write(self, buf):
+        with self.condition:
+            self.frame = buf
+            self.condition.notify_all()
+        return len(buf)
+
+# Initialize the global streaming buffer
+stream_buffer = StreamingBuffer()
+
+# ----------------------------------------------------------------------
+# 2. Camera Setup (Background Encoding)
+# ----------------------------------------------------------------------
 camera = picamera2.Picamera2()
 config = camera.create_video_configuration(main={"size": (1280, 720)})
 camera.configure(config)
+
+# Fix: Wrap the memory stream buffer inside FileOutput
+# (Picamera2 expects ALL outputs to inherit from its base Output class)
+camera.start_recording(JpegEncoder(), FileOutput(stream_buffer))
 camera.start()
 
-# Motion state
+# ----------------------------------------------------------------------
+# 3. Motion Detection (Runs in a separate background thread)
+# ----------------------------------------------------------------------
 prev_gray = None
 is_recording = False
 recording_lock = Lock()
@@ -52,52 +79,66 @@ def start_recording():
 
     timestamp = time.strftime('%Y%m%d-%H%M%S')
     filename = f'{RECORDING_DIR}/motion_{timestamp}.mp4'
-    from picamera2.outputs import FfmpegOutput  # Import here to avoid startup cost
+    from picamera2.outputs import FfmpegOutput
     from picamera2.encoders import H264Encoder
 
     output = FfmpegOutput(filename)
     encoder = H264Encoder(bitrate=VIDEO_BITRATE) 
-    camera.start_recording(encoder, output)
+    
+    # We use start_encoder alongside the already-running JpegEncoder
+    camera.start_encoder(encoder, output)
     logger.info(f"[MOTION] Recording MP4 started: {filename}")
     time.sleep(clip_length)
-    camera.stop_recording()
+    camera.stop_encoder(encoder)
     logger.info(f"[MOTION] MP4 Recording finished: {filename}")
     is_recording = False
 
-def process_motion(frame):
+def motion_worker():
+    """Background thread that constantly checks for motion."""
     global prev_gray
-    with config_lock:
-        threshold = MOTION_THRESHOLD  # thread-safe read
-          
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (21, 21), 0)
-    
-    if prev_gray is not None:
-        frame_delta = cv2.absdiff(prev_gray, gray)
-        thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
-        motion_score = int(thresh.sum())
+    while True:
+        # Grab a frame specifically for OpenCV processing
+        try:
+            frame = camera.capture_array()
+        except Exception:
+            time.sleep(0.1)
+            continue
+            
+        with config_lock:
+            threshold = MOTION_THRESHOLD
+              
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (21, 21), 0)
         
-        if MOTION_ENABLED and motion_score > MOTION_THRESHOLD:
-            # Run recording in background thread
-            threading.Thread(target=start_recording, daemon=True).start()
-            logger.info(f"[MOTION] Detected: {motion_score} (threshold: {MOTION_THRESHOLD})")
-    
-    prev_gray = gray
+        if prev_gray is not None:
+            frame_delta = cv2.absdiff(prev_gray, gray)
+            thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
+            motion_score = int(thresh.sum())
+            
+            if MOTION_ENABLED and motion_score > threshold:
+                threading.Thread(target=start_recording, daemon=True).start()
+                logger.info(f"[MOTION] Detected: {motion_score} (threshold: {threshold})")
+        
+        prev_gray = gray
+        time.sleep(0.1)  # ~10fps analysis to save CPU
+
+# Start the motion detection loop in the background
+threading.Thread(target=motion_worker, daemon=True).start()
+
+# ----------------------------------------------------------------------
+# 4. Flask Web Routes
+# ----------------------------------------------------------------------
 
 def gen_frames():
+    """Yields frames to the browser safely using the condition variable."""
     while True:
-        frame = camera.capture_array()
-        
-        # Motion detection on every frame
-        process_motion(frame)
-        
-        # Fix colours for web stream (BGR -> RGB)
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        ret, jpeg = cv2.imencode('.jpg', rgb_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-        
-        time.sleep(0.1)  # ~10fps for Zero 2W
+        with stream_buffer.condition:
+            stream_buffer.condition.wait()
+            frame = stream_buffer.frame
+            
+        if frame is not None:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
 @app.route('/')
 def index():
@@ -141,18 +182,18 @@ def toggle():
 @app.route('/videos')
 def list_videos():
     videos = []
-    for filename in sorted(os.listdir(RECORDING_DIR), reverse=True)[:50]:  # last 20
-#        if filename.endswith('.mp4'):
-          path = os.path.join(RECORDING_DIR, filename)
-          stat = os.stat(path)
-          mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime))
-          size_mb = round(stat.st_size / (1024*1024), 1)
-          videos.append({
-              'filename': filename,
-              'mtime': mtime,
-              'size_mb': size_mb,
-              'url': f'/download/{filename}'
-          })
+    for filename in sorted(os.listdir(RECORDING_DIR), reverse=True)[:50]:
+        if filename.endswith('.mp4'):
+            path = os.path.join(RECORDING_DIR, filename)
+            stat = os.stat(path)
+            mtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime))
+            size_mb = round(stat.st_size / (1024*1024), 1)
+            videos.append({
+                'filename': filename,
+                'mtime': mtime,
+                'size_mb': size_mb,
+                'url': f'/download/{filename}'
+            })
 
     html = '''
     <!DOCTYPE html>
@@ -191,7 +232,6 @@ def list_videos():
                 <th>Download</th>
             </tr>
         '''
-
         for video in videos:
             html += f'''
             <tr>
@@ -208,7 +248,6 @@ def list_videos():
 
     html += '''
         <script>
-        // Generate thumbnails from first frame (client-side)
         document.querySelectorAll('canvas.thumb').forEach(canvas => {{
             canvas.addEventListener('load', function() {{
                 const ctx = this.getContext('2d');
@@ -228,7 +267,6 @@ def list_videos():
 
 @app.route('/download/<filename>')
 def download(filename):
-    path = os.path.join(RECORDING_DIR, filename)
     return send_from_directory(RECORDING_DIR, filename, as_attachment=True, download_name=filename)
 
 @app.route('/config', methods=['GET', 'POST'])
@@ -242,7 +280,6 @@ def config():
             VIDEO_BITRATE = int(request.form.get('bitrate', VIDEO_BITRATE))
         logger.info(f"CONFIG: sensitivity={MOTION_THRESHOLD}, clip={CLIP_SECONDS}s, bitrate={VIDEO_BITRATE}")
     
-    # Sliders with current values
     html = f'''
     <!DOCTYPE html>
     <html>
@@ -269,24 +306,16 @@ def config():
             
             <button type="submit" style="padding:12px 24px;font-size:18px">💾 Apply Settings</button>
         </form>
-        <p><strong>Current Status:</strong><br>
-        Motion: {"ON" if MOTION_ENABLED else "OFF"} | 
-        Threshold: {MOTION_THRESHOLD:,} | 
-        Clip: {CLIP_SECONDS}s | 
-        Bitrate: {VIDEO_BITRATE//1000000}Mbps</p>
     </body>
     </html>
     '''
     return html
 
-
 if __name__ == '__main__':
     logger.info("PiCam Motion Webcam (Gevent mode) starting on http://0.0.0.0:5000")
-    logger.info("Tune MOTION_THRESHOLD if needed (lower = more sensitive)")
-
+    from gevent.pywsgi import WSGIServer
     try:
-        app.run(host='0.0.0.0', port=5000, threaded=True)
+        WSGIServer(('0.0.0.0', 5000), app).serve_forever()
     finally:
         camera.stop()
-
 
