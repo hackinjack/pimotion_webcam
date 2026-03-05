@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+    systemctl daemon-reload
+    systemctl enable webcam.service
+    systemctl restart webcam.service
+fi
+exit 0
+
