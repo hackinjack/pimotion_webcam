@@ -1,0 +1,11 @@
+Package: picam-webcam
+Version: 1.0-1
+Section: video
+Priority: optional
+Architecture: all
+Depends: python3, python3-flask, python3-picamera2, python3-opencv, python3-gevent, python3-numpy, ffmpeg
+Maintainer: Jack Knight <jfk@linux.com>
+Description: PiCam Motion Webcam with Flask and Picamera2
+ A headless, non-blocking motion detection webcam server 
+ for Raspberry Pi using Picamera2, OpenCV, and Gevent.
+

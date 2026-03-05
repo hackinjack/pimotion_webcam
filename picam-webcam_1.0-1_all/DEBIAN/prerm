@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+if [ "$1" = "remove" ]; then
+    systemctl stop webcam.service || true
+    systemctl disable webcam.service || true
+fi
+exit 0
+
