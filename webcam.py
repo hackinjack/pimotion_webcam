@@ -97,33 +97,44 @@ def motion_worker():
     """Background thread that constantly checks for motion."""
     global prev_gray
     while True:
-        # Grab a frame specifically for OpenCV processing
-        try:
-            frame = camera.capture_array()
-        except Exception:
+        # Instead of putting load on the camera with capture_array(),
+        # we just grab the JPEG that is already being generated for the web stream.
+        with stream_buffer.condition:
+            stream_buffer.condition.wait(timeout=1.0)
+            jpeg_bytes = stream_buffer.frame
+            
+        if jpeg_bytes is None:
             time.sleep(0.1)
             continue
             
-        with config_lock:
-            threshold = MOTION_THRESHOLD
-              
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (21, 21), 0)
-        
-        if prev_gray is not None:
-            frame_delta = cv2.absdiff(prev_gray, gray)
-            thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
-            motion_score = int(thresh.sum())
+        try:
+            # Decode the JPEG into an OpenCV array
+            np_arr = np.frombuffer(jpeg_bytes, np.uint8)
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             
-            if MOTION_ENABLED and motion_score > threshold:
-                threading.Thread(target=start_recording, daemon=True).start()
-                logger.info(f"[MOTION] Detected: {motion_score} (threshold: {threshold})")
-        
-        prev_gray = gray
-        time.sleep(0.1)  # ~10fps analysis to save CPU
+            if frame is None:
+                continue
 
-# Start the motion detection loop in the background
-threading.Thread(target=motion_worker, daemon=True).start()
+            with config_lock:
+                threshold = MOTION_THRESHOLD
+                  
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (21, 21), 0)
+            
+            if prev_gray is not None:
+                frame_delta = cv2.absdiff(prev_gray, gray)
+                thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
+                motion_score = int(thresh.sum())
+                
+                if MOTION_ENABLED and motion_score > threshold:
+                    threading.Thread(target=start_recording, daemon=True).start()
+                    logger.info(f"[MOTION] Detected: {motion_score} (threshold: {threshold})")
+            
+            prev_gray = gray
+        except Exception as e:
+            logger.error(f"Motion processing error: {e}")
+            
+        time.sleep(0.2)  # Throttle to ~5fps for motion analysis to save CPU
 
 # ----------------------------------------------------------------------
 # 4. Flask Web Routes
@@ -314,8 +325,29 @@ def config():
 if __name__ == '__main__':
     logger.info("PiCam Motion Webcam (Gevent mode) starting on http://0.0.0.0:5000")
     from gevent.pywsgi import WSGIServer
+    import gevent
+    import signal
+
+    server = WSGIServer(('0.0.0.0', 5000), app)
+
+    # Graceful shutdown handler
+    def shutdown():
+        logger.info("Shutting down... releasing camera.")
+        server.stop()
+        try:
+            camera.stop()
+            camera.close()
+        except Exception as e:
+            logger.error(f"Error closing camera: {e}")
+
+    # Catch systemd stop/restart signals
+    gevent.signal_handler(signal.SIGTERM, shutdown)
+    gevent.signal_handler(signal.SIGINT, shutdown)
+
     try:
-        WSGIServer(('0.0.0.0', 5000), app).serve_forever()
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
     finally:
-        camera.stop()
+        shutdown()
 
