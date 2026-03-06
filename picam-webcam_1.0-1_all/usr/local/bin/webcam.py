@@ -2,6 +2,21 @@
 import gevent.monkey
 gevent.monkey.patch_all()
 
+import os
+import time
+import subprocess
+
+import shutil
+import json
+
+# --- PRE-INIT CLEANUP ---
+# Forcibly clear any ghost libcamera processes holding /dev/video0 BEFORE importing picamera2
+try:
+    subprocess.run(["fuser", "-k", "/dev/video0"], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    time.sleep(1) # Let the V4L2 kernel driver unmap the memory
+except Exception:
+    pass
+
 from flask import Flask, Response, render_template_string, send_from_directory, request
 import picamera2
 from picamera2.encoders import JpegEncoder
@@ -9,8 +24,6 @@ from picamera2.outputs import FileOutput
 import io
 from threading import Condition, Lock
 import threading
-import time
-import os
 import cv2
 import numpy as np
 import logging
@@ -24,42 +37,70 @@ app = Flask(__name__)
 MOTION_THRESHOLD = 1500000    # pixels changed (500k-5M)
 CLIP_SECONDS = 10             # recording duration (5-60s)
 VIDEO_BITRATE = 10000000      # MP4 quality (5M-20M)
-MOTION_ENABLED = True
 RECORDING_DIR = '/home/jfk/videos'
+CONFIG_FILE = '/home/jfk/webcam_config.json'MOTION_ENABLED = True
+
 
 # Web config state (thread-safe)
 config_lock = Lock()
+load_config() # Call this immediately on startup
 os.makedirs(RECORDING_DIR, exist_ok=True)
+
+def load_config():
+    global MOTION_THRESHOLD, CLIP_SECONDS, VIDEO_BITRATE, MOTION_ENABLED
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                data = json.load(f)
+                MOTION_THRESHOLD = data.get("MOTION_THRESHOLD", MOTION_THRESHOLD)
+                CLIP_SECONDS = data.get("CLIP_SECONDS", CLIP_SECONDS)
+                VIDEO_BITRATE = data.get("VIDEO_BITRATE", VIDEO_BITRATE)
+                MOTION_ENABLED = data.get("MOTION_ENABLED", MOTION_ENABLED)
+                logger.info("Loaded persistent configuration.")
+        except Exception as e:
+            logger.error(f"Failed to load config: {e}")
+
+def save_config():
+    with config_lock:
+        data = {
+            "MOTION_THRESHOLD": MOTION_THRESHOLD,
+            "CLIP_SECONDS": CLIP_SECONDS,
+            "VIDEO_BITRATE": VIDEO_BITRATE,
+            "MOTION_ENABLED": MOTION_ENABLED
+        }
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
+
+
 
 # ----------------------------------------------------------------------
 # 1. Thread-safe Streaming Output Class
-# Parses raw chunked file bytes into valid JPEG frames
+# Robustly parses raw MJPEG byte streams into valid JPEG frames
 # ----------------------------------------------------------------------
 class StreamingBuffer(io.BufferedIOBase):
     def __init__(self):
         self.frame = None
         self.condition = Condition()
-        self.buffer = io.BytesIO()
+        self.buffer = b''
 
     def write(self, buf):
-        # Check if this chunk is the start of a new JPEG image
-        if buf.startswith(b'\xff\xd8'):
-            # It's a new frame! Save the old buffer as a complete frame
-            self.buffer.seek(0)
-            completed_frame = self.buffer.read()
+        self.buffer += buf
+        
+        # Search for JPEG End of Image marker (\xff\xd9)
+        a = self.buffer.find(b'\xff\xd8') # Start of Image
+        b = self.buffer.find(b'\xff\xd9') # End of Image
+        
+        if a != -1 and b != -1 and b > a:
+            # We found a complete frame!
+            completed_frame = self.buffer[a:b+2]
             
-            # Reset buffer for the new frame
-            self.buffer.seek(0)
-            self.buffer.truncate()
+            # Keep whatever bytes came after this frame for the next loop
+            self.buffer = self.buffer[b+2:]
             
-            # Notify clients that a complete frame is ready
-            if len(completed_frame) > 0:
-                with self.condition:
-                    self.frame = completed_frame
-                    self.condition.notify_all()
-                    
-        # Append the new chunk to the current buffer
-        self.buffer.write(buf)
+            with self.condition:
+                self.frame = completed_frame
+                self.condition.notify_all()
+                
         return len(buf)
 
 # Initialize the global streaming buffer
@@ -68,12 +109,16 @@ stream_buffer = StreamingBuffer()
 # ----------------------------------------------------------------------
 # 2. Camera Setup (Background Encoding)
 # ----------------------------------------------------------------------
+logger.info("Acquiring camera...")
 camera = picamera2.Picamera2()
-config = camera.create_video_configuration(main={"size": (1280, 720)})
+
+# Create config and explicitly disable buffering to prevent memory leaks
+config = camera.create_video_configuration(main={"size": (1280, 720)}, queue=False)
 camera.configure(config)
 
 camera.start_recording(JpegEncoder(), FileOutput(stream_buffer))
 camera.start()
+logger.info("Camera initialized and streaming.")
 
 # ----------------------------------------------------------------------
 # 3. Motion Detection (Runs in a separate background thread)
@@ -112,11 +157,10 @@ def motion_worker():
     global prev_gray
     while True:
         with stream_buffer.condition:
-            # Wait for a fully completed JPEG frame
             stream_buffer.condition.wait(timeout=1.0)
             jpeg_bytes = stream_buffer.frame
             
-        if jpeg_bytes is None:
+        if jpeg_bytes is None or len(jpeg_bytes) == 0:
             time.sleep(0.1)
             continue
             
@@ -151,6 +195,21 @@ def motion_worker():
 
 threading.Thread(target=motion_worker, daemon=True).start()
 
+# ======================================================================
+# DASHBOARD LOGIC
+# ======================================================================
+current_brightness = 100 # Placeholder for Stage 3
+
+def get_sys_status():
+    """Gets CPU Temp and Disk Space for dashboard."""
+    try:
+        temp = os.popen("vcgencmd measure_temp").readline().strip().replace("temp=","")
+    except:
+        temp = "N/A"
+    total, used, free = shutil.disk_usage("/")
+    free_gb = free // (2**30)
+    return temp, free_gb
+
 # ----------------------------------------------------------------------
 # 4. Flask Web Routes
 # ----------------------------------------------------------------------
@@ -173,26 +232,75 @@ def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>RPi Zero 2W PiCam Motion Webcam</title>
-        <style>body{{font-family:Arial}} button{{padding:10px;font-size:18px}}</style>
+        <title>PiCam Security</title>
+        <style>
+            body {{ font-family: Arial; background: #222; color: white; text-align: center; margin: 0; padding: 20px; }}
+            .video-container {{ position: relative; display: inline-block; border: 3px solid #444; border-radius: 8px; overflow: hidden; }}
+            .timestamp {{ position: absolute; bottom: 10px; right: 15px; color: yellow; font-size: 20px; font-weight: bold; background: rgba(0,0,0,0.5); padding: 2px 8px; border-radius: 4px; font-family: monospace; }}
+            button, .btn {{ padding: 10px 15px; font-size: 16px; margin: 5px; cursor: pointer; text-decoration: none; color: black; background: #ddd; border-radius: 5px; }}
+        </style>
     </head>
     <body>
-        <h1>RPi Zero 2W PiCam Motion Webcam</h1>
-        <img src="/video_feed" width="640" height="480">
+        <h2>🛡️ PiCam Zero 2W</h2>
+        <div class="video-container">
+            <img src="/video_feed" width="640" height="480">
+            <div class="timestamp" id="clock"></div>
+        </div>
         <br><br>
-        <button onclick="toggleMotion()">Motion Detection: <span id="status">{status}</span></button>
-        <a href="/config" style="color:blue;font-size:18px;margin-left:20px">⚙️ Config</a>
-
-        <p>Threshold: {MOTION_THRESHOLD} | Videos: <a href="/videos">[List Recordings]</a></p>
+        <button onclick="fetch('/toggle').then(()=>location.reload())">Motion: {status}</button>
+        <a href="/config" class="btn">⚙️ Settings</a>
+        <a href="/videos" class="btn">📹 Recordings</a>
+        
         <script>
-        async function toggleMotion() {{
-            const res = await fetch('/toggle');
-            if (res.ok) location.reload();
-        }}
+            // Live JS Clock for Overlay
+            setInterval(() => {{
+                let d = new Date();
+                document.getElementById('clock').innerText = d.toISOString().replace('T', ' ').substring(0, 19);
+            }}, 1000);
         </script>
     </body>
     </html>
     ''')
+
+@app.route('/config', methods=['GET', 'POST'])
+def config():
+    global MOTION_THRESHOLD, CLIP_SECONDS, VIDEO_BITRATE
+    
+    if request.method == 'POST':
+        with config_lock:
+            MOTION_THRESHOLD = int(request.form.get('sensitivity', MOTION_THRESHOLD))
+            CLIP_SECONDS = int(request.form.get('clip_length', CLIP_SECONDS))
+            VIDEO_BITRATE = int(request.form.get('bitrate', VIDEO_BITRATE))
+        logger.info(f"CONFIG: sensitivity={MOTION_THRESHOLD}, clip={CLIP_SECONDS}s, bitrate={VIDEO_BITRATE}")
+        save_config()
+    
+    cpu_temp, disk_free = get_sys_status()
+    
+    html = f'''
+    <!DOCTYPE html><html><head><title>Config</title><style>body{{font-family:Arial; margin:40px}}</style></head>
+    <body>
+        <h1>⚙️ Dashboard & Config</h1>
+        <a href="/">🏠 Live View</a><hr>
+        
+        <div style="background:#eee; color:black; padding:15px; border-radius:8px; margin-bottom:20px; width:400px;">
+            <h3>📊 System Status</h3>
+            <b>CPU Temp:</b> {cpu_temp}<br>
+            <b>SD Card Free:</b> {disk_free} GB<br>
+            <b>Light Level:</b> {int(current_brightness)}/255<br>
+        </div>
+
+        <form method="POST">
+            <p><b>Sensitivity (Threshold):</b> {MOTION_THRESHOLD}<br>
+            <input type="range" name="sensitivity" min="500000" max="5000000" step="100000" value="{MOTION_THRESHOLD}" style="width:300px"></p>
+            <p><b>Clip Length (sec):</b> {CLIP_SECONDS}<br>
+            <input type="range" name="clip_length" min="5" max="60" step="5" value="{CLIP_SECONDS}" style="width:300px"></p>
+            <p><b>Bitrate (bps):</b> {VIDEO_BITRATE}<br>
+            <input type="range" name="bitrate" min="5000000" max="20000000" step="1000000" value="{VIDEO_BITRATE}" style="width:300px"></p>
+            <button type="submit" style="padding:10px 20px; background:#4CAF50; color:white; border:none;">💾 Save Settings</button>
+        </form>
+    </body></html>
+    '''
+    return html
 
 @app.route('/video_feed')
 def video_feed():
@@ -203,6 +311,7 @@ def toggle():
     global MOTION_ENABLED
     MOTION_ENABLED = not MOTION_ENABLED
     logger.info(f"[WEB] Motion toggled {'ON' if MOTION_ENABLED else 'OFF'}")
+    save_config()
     return 'OK'
 
 @app.route('/videos')
@@ -294,48 +403,6 @@ def list_videos():
 @app.route('/download/<filename>')
 def download(filename):
     return send_from_directory(RECORDING_DIR, filename, as_attachment=True, download_name=filename)
-
-@app.route('/config', methods=['GET', 'POST'])
-def config():
-    global MOTION_THRESHOLD, CLIP_SECONDS, VIDEO_BITRATE
-    
-    if request.method == 'POST':
-        with config_lock:
-            MOTION_THRESHOLD = int(request.form.get('sensitivity', MOTION_THRESHOLD))
-            CLIP_SECONDS = int(request.form.get('clip_length', CLIP_SECONDS))
-            VIDEO_BITRATE = int(request.form.get('bitrate', VIDEO_BITRATE))
-        logger.info(f"CONFIG: sensitivity={MOTION_THRESHOLD}, clip={CLIP_SECONDS}s, bitrate={VIDEO_BITRATE}")
-    
-    html = f'''
-    <!DOCTYPE html>
-    <html>
-    <head><title>Config</title>
-    <style>body{{font-family:Arial;margin:40px}} input[type=range]{{width:300px}}</style>
-    </head>
-    <body>
-        <h1>📱 Webcam Config</h1>
-        <a href="/" style="color:blue;font-size:18px">🏠 Live View</a>
-        <form method="POST">
-            <p><label>Sensitivity: <span id="sens_val">{MOTION_THRESHOLD}</span></label><br>
-            <input type="range" name="sensitivity" min="500000" max="5000000" step="100000" 
-                   value="{MOTION_THRESHOLD}" oninput="document.getElementById('sens_val').innerText=this.value">
-            <br><small>Lower = more sensitive (hand wave triggers)</small></p>
-            
-            <p><label>Clip Length: <span id="clip_val">{CLIP_SECONDS}</span>s</label><br>
-            <input type="range" name="clip_length" min="5" max="60" step="5" 
-                   value="{CLIP_SECONDS}" oninput="document.getElementById('clip_val').innerText=this.value">s</p>
-            
-            <p><label>Video Bitrate: <span id="bit_val">{VIDEO_BITRATE//1000000}</span>Mbps</label><br>
-            <input type="range" name="bitrate" min="5000000" max="20000000" step="1000000" 
-                   value="{VIDEO_BITRATE}" oninput="document.getElementById('bit_val').innerText=Math.round(this.value/1000000)+'M'">
-            <br><small>Higher = better quality (slower on Zero 2W)</small></p>
-            
-            <button type="submit" style="padding:12px 24px;font-size:18px">💾 Apply Settings</button>
-        </form>
-    </body>
-    </html>
-    '''
-    return html
 
 if __name__ == '__main__':
     logger.info("PiCam Motion Webcam (Gevent mode) starting on http://0.0.0.0:5000")
