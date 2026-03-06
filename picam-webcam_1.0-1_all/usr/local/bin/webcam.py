@@ -372,48 +372,6 @@ def list_videos():
 def download(filename):
     return send_from_directory(RECORDING_DIR, filename, as_attachment=True, download_name=filename)
 
-@app.route('/config', methods=['GET', 'POST'])
-def config():
-    global MOTION_THRESHOLD, CLIP_SECONDS, VIDEO_BITRATE
-    
-    if request.method == 'POST':
-        with config_lock:
-            MOTION_THRESHOLD = int(request.form.get('sensitivity', MOTION_THRESHOLD))
-            CLIP_SECONDS = int(request.form.get('clip_length', CLIP_SECONDS))
-            VIDEO_BITRATE = int(request.form.get('bitrate', VIDEO_BITRATE))
-        logger.info(f"CONFIG: sensitivity={MOTION_THRESHOLD}, clip={CLIP_SECONDS}s, bitrate={VIDEO_BITRATE}")
-    
-    html = f'''
-    <!DOCTYPE html>
-    <html>
-    <head><title>Config</title>
-    <style>body{{font-family:Arial;margin:40px}} input[type=range]{{width:300px}}</style>
-    </head>
-    <body>
-        <h1>📱 Webcam Config</h1>
-        <a href="/" style="color:blue;font-size:18px">🏠 Live View</a>
-        <form method="POST">
-            <p><label>Sensitivity: <span id="sens_val">{MOTION_THRESHOLD}</span></label><br>
-            <input type="range" name="sensitivity" min="500000" max="5000000" step="100000" 
-                   value="{MOTION_THRESHOLD}" oninput="document.getElementById('sens_val').innerText=this.value">
-            <br><small>Lower = more sensitive (hand wave triggers)</small></p>
-            
-            <p><label>Clip Length: <span id="clip_val">{CLIP_SECONDS}</span>s</label><br>
-            <input type="range" name="clip_length" min="5" max="60" step="5" 
-                   value="{CLIP_SECONDS}" oninput="document.getElementById('clip_val').innerText=this.value">s</p>
-            
-            <p><label>Video Bitrate: <span id="bit_val">{VIDEO_BITRATE//1000000}</span>Mbps</label><br>
-            <input type="range" name="bitrate" min="5000000" max="20000000" step="1000000" 
-                   value="{VIDEO_BITRATE}" oninput="document.getElementById('bit_val').innerText=Math.round(this.value/1000000)+'M'">
-            <br><small>Higher = better quality (slower on Zero 2W)</small></p>
-            
-            <button type="submit" style="padding:12px 24px;font-size:18px">💾 Apply Settings</button>
-        </form>
-    </body>
-    </html>
-    '''
-    return html
-
 if __name__ == '__main__':
     logger.info("PiCam Motion Webcam (Gevent mode) starting on http://0.0.0.0:5000")
     from gevent.pywsgi import WSGIServer
