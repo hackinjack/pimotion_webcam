@@ -38,7 +38,8 @@ MOTION_THRESHOLD = 1500000    # pixels changed (500k-5M)
 CLIP_SECONDS = 10             # recording duration (5-60s)
 VIDEO_BITRATE = 10000000      # MP4 quality (5M-20M)
 RECORDING_DIR = '/home/jfk/videos'
-CONFIG_FILE = '/home/jfk/webcam_config.json'MOTION_ENABLED = True
+CONFIG_FILE = '/home/jfk/webcam_config.json'
+MOTION_ENABLED = True
 
 
 # Web config state (thread-safe)
