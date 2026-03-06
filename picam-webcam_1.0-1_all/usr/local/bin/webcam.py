@@ -2,6 +2,18 @@
 import gevent.monkey
 gevent.monkey.patch_all()
 
+import os
+import time
+import subprocess
+
+# --- PRE-INIT CLEANUP ---
+# Forcibly clear any ghost libcamera processes holding /dev/video0 BEFORE importing picamera2
+try:
+    subprocess.run(["fuser", "-k", "/dev/video0"], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    time.sleep(1) # Let the V4L2 kernel driver unmap the memory
+except Exception:
+    pass
+
 from flask import Flask, Response, render_template_string, send_from_directory, request
 import picamera2
 from picamera2.encoders import JpegEncoder
@@ -9,8 +21,6 @@ from picamera2.outputs import FileOutput
 import io
 from threading import Condition, Lock
 import threading
-import time
-import os
 import cv2
 import numpy as np
 import logging
@@ -33,33 +43,32 @@ os.makedirs(RECORDING_DIR, exist_ok=True)
 
 # ----------------------------------------------------------------------
 # 1. Thread-safe Streaming Output Class
-# Parses raw chunked file bytes into valid JPEG frames
+# Robustly parses raw MJPEG byte streams into valid JPEG frames
 # ----------------------------------------------------------------------
 class StreamingBuffer(io.BufferedIOBase):
     def __init__(self):
         self.frame = None
         self.condition = Condition()
-        self.buffer = io.BytesIO()
+        self.buffer = b''
 
     def write(self, buf):
-        # Check if this chunk is the start of a new JPEG image
-        if buf.startswith(b'\xff\xd8'):
-            # It's a new frame! Save the old buffer as a complete frame
-            self.buffer.seek(0)
-            completed_frame = self.buffer.read()
+        self.buffer += buf
+        
+        # Search for JPEG End of Image marker (\xff\xd9)
+        a = self.buffer.find(b'\xff\xd8') # Start of Image
+        b = self.buffer.find(b'\xff\xd9') # End of Image
+        
+        if a != -1 and b != -1 and b > a:
+            # We found a complete frame!
+            completed_frame = self.buffer[a:b+2]
             
-            # Reset buffer for the new frame
-            self.buffer.seek(0)
-            self.buffer.truncate()
+            # Keep whatever bytes came after this frame for the next loop
+            self.buffer = self.buffer[b+2:]
             
-            # Notify clients that a complete frame is ready
-            if len(completed_frame) > 0:
-                with self.condition:
-                    self.frame = completed_frame
-                    self.condition.notify_all()
-                    
-        # Append the new chunk to the current buffer
-        self.buffer.write(buf)
+            with self.condition:
+                self.frame = completed_frame
+                self.condition.notify_all()
+                
         return len(buf)
 
 # Initialize the global streaming buffer
@@ -68,12 +77,16 @@ stream_buffer = StreamingBuffer()
 # ----------------------------------------------------------------------
 # 2. Camera Setup (Background Encoding)
 # ----------------------------------------------------------------------
+logger.info("Acquiring camera...")
 camera = picamera2.Picamera2()
-config = camera.create_video_configuration(main={"size": (1280, 720)})
+
+# Create config and explicitly disable buffering to prevent memory leaks
+config = camera.create_video_configuration(main={"size": (1280, 720)}, queue=False)
 camera.configure(config)
 
 camera.start_recording(JpegEncoder(), FileOutput(stream_buffer))
 camera.start()
+logger.info("Camera initialized and streaming.")
 
 # ----------------------------------------------------------------------
 # 3. Motion Detection (Runs in a separate background thread)
@@ -112,11 +125,10 @@ def motion_worker():
     global prev_gray
     while True:
         with stream_buffer.condition:
-            # Wait for a fully completed JPEG frame
             stream_buffer.condition.wait(timeout=1.0)
             jpeg_bytes = stream_buffer.frame
             
-        if jpeg_bytes is None:
+        if jpeg_bytes is None or len(jpeg_bytes) == 0:
             time.sleep(0.1)
             continue
             
