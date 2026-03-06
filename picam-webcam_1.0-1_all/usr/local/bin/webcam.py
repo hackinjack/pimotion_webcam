@@ -6,6 +6,8 @@ import os
 import time
 import subprocess
 
+import shutil
+
 # --- PRE-INIT CLEANUP ---
 # Forcibly clear any ghost libcamera processes holding /dev/video0 BEFORE importing picamera2
 try:
@@ -163,6 +165,21 @@ def motion_worker():
 
 threading.Thread(target=motion_worker, daemon=True).start()
 
+# ======================================================================
+# DASHBOARD LOGIC
+# ======================================================================
+current_brightness = 100 # Placeholder for Stage 3
+
+def get_sys_status():
+    """Gets CPU Temp and Disk Space for dashboard."""
+    try:
+        temp = os.popen("vcgencmd measure_temp").readline().strip().replace("temp=","")
+    except:
+        temp = "N/A"
+    total, used, free = shutil.disk_usage("/")
+    free_gb = free // (2**30)
+    return temp, free_gb
+
 # ----------------------------------------------------------------------
 # 4. Flask Web Routes
 # ----------------------------------------------------------------------
@@ -185,26 +202,74 @@ def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>RPi Zero 2W PiCam Motion Webcam</title>
-        <style>body{{font-family:Arial}} button{{padding:10px;font-size:18px}}</style>
+        <title>PiCam Security</title>
+        <style>
+            body {{ font-family: Arial; background: #222; color: white; text-align: center; margin: 0; padding: 20px; }}
+            .video-container {{ position: relative; display: inline-block; border: 3px solid #444; border-radius: 8px; overflow: hidden; }}
+            .timestamp {{ position: absolute; bottom: 10px; right: 15px; color: yellow; font-size: 20px; font-weight: bold; background: rgba(0,0,0,0.5); padding: 2px 8px; border-radius: 4px; font-family: monospace; }}
+            button, .btn {{ padding: 10px 15px; font-size: 16px; margin: 5px; cursor: pointer; text-decoration: none; color: black; background: #ddd; border-radius: 5px; }}
+        </style>
     </head>
     <body>
-        <h1>RPi Zero 2W PiCam Motion Webcam</h1>
-        <img src="/video_feed" width="640" height="480">
+        <h2>🛡️ PiCam Zero 2W</h2>
+        <div class="video-container">
+            <img src="/video_feed" width="640" height="480">
+            <div class="timestamp" id="clock"></div>
+        </div>
         <br><br>
-        <button onclick="toggleMotion()">Motion Detection: <span id="status">{status}</span></button>
-        <a href="/config" style="color:blue;font-size:18px;margin-left:20px">⚙️ Config</a>
-
-        <p>Threshold: {MOTION_THRESHOLD} | Videos: <a href="/videos">[List Recordings]</a></p>
+        <button onclick="fetch('/toggle').then(()=>location.reload())">Motion: {status}</button>
+        <a href="/config" class="btn">⚙️ Settings</a>
+        <a href="/videos" class="btn">📹 Recordings</a>
+        
         <script>
-        async function toggleMotion() {{
-            const res = await fetch('/toggle');
-            if (res.ok) location.reload();
-        }}
+            // Live JS Clock for Overlay
+            setInterval(() => {{
+                let d = new Date();
+                document.getElementById('clock').innerText = d.toISOString().replace('T', ' ').substring(0, 19);
+            }}, 1000);
         </script>
     </body>
     </html>
     ''')
+
+@app.route('/config', methods=['GET', 'POST'])
+def config():
+    global MOTION_THRESHOLD, CLIP_SECONDS, VIDEO_BITRATE
+    
+    if request.method == 'POST':
+        with config_lock:
+            MOTION_THRESHOLD = int(request.form.get('sensitivity', MOTION_THRESHOLD))
+            CLIP_SECONDS = int(request.form.get('clip_length', CLIP_SECONDS))
+            VIDEO_BITRATE = int(request.form.get('bitrate', VIDEO_BITRATE))
+        logger.info(f"CONFIG: sensitivity={MOTION_THRESHOLD}, clip={CLIP_SECONDS}s, bitrate={VIDEO_BITRATE}")
+    
+    cpu_temp, disk_free = get_sys_status()
+    
+    html = f'''
+    <!DOCTYPE html><html><head><title>Config</title><style>body{{font-family:Arial; margin:40px}}</style></head>
+    <body>
+        <h1>⚙️ Dashboard & Config</h1>
+        <a href="/">🏠 Live View</a><hr>
+        
+        <div style="background:#eee; color:black; padding:15px; border-radius:8px; margin-bottom:20px; width:400px;">
+            <h3>📊 System Status</h3>
+            <b>CPU Temp:</b> {cpu_temp}<br>
+            <b>SD Card Free:</b> {disk_free} GB<br>
+            <b>Light Level:</b> {int(current_brightness)}/255<br>
+        </div>
+
+        <form method="POST">
+            <p><b>Sensitivity (Threshold):</b> {MOTION_THRESHOLD}<br>
+            <input type="range" name="sensitivity" min="500000" max="5000000" step="100000" value="{MOTION_THRESHOLD}" style="width:300px"></p>
+            <p><b>Clip Length (sec):</b> {CLIP_SECONDS}<br>
+            <input type="range" name="clip_length" min="5" max="60" step="5" value="{CLIP_SECONDS}" style="width:300px"></p>
+            <p><b>Bitrate (bps):</b> {VIDEO_BITRATE}<br>
+            <input type="range" name="bitrate" min="5000000" max="20000000" step="1000000" value="{VIDEO_BITRATE}" style="width:300px"></p>
+            <button type="submit" style="padding:10px 20px; background:#4CAF50; color:white; border:none;">💾 Save Settings</button>
+        </form>
+    </body></html>
+    '''
+    return html
 
 @app.route('/video_feed')
 def video_feed():
@@ -306,48 +371,6 @@ def list_videos():
 @app.route('/download/<filename>')
 def download(filename):
     return send_from_directory(RECORDING_DIR, filename, as_attachment=True, download_name=filename)
-
-@app.route('/config', methods=['GET', 'POST'])
-def config():
-    global MOTION_THRESHOLD, CLIP_SECONDS, VIDEO_BITRATE
-    
-    if request.method == 'POST':
-        with config_lock:
-            MOTION_THRESHOLD = int(request.form.get('sensitivity', MOTION_THRESHOLD))
-            CLIP_SECONDS = int(request.form.get('clip_length', CLIP_SECONDS))
-            VIDEO_BITRATE = int(request.form.get('bitrate', VIDEO_BITRATE))
-        logger.info(f"CONFIG: sensitivity={MOTION_THRESHOLD}, clip={CLIP_SECONDS}s, bitrate={VIDEO_BITRATE}")
-    
-    html = f'''
-    <!DOCTYPE html>
-    <html>
-    <head><title>Config</title>
-    <style>body{{font-family:Arial;margin:40px}} input[type=range]{{width:300px}}</style>
-    </head>
-    <body>
-        <h1>📱 Webcam Config</h1>
-        <a href="/" style="color:blue;font-size:18px">🏠 Live View</a>
-        <form method="POST">
-            <p><label>Sensitivity: <span id="sens_val">{MOTION_THRESHOLD}</span></label><br>
-            <input type="range" name="sensitivity" min="500000" max="5000000" step="100000" 
-                   value="{MOTION_THRESHOLD}" oninput="document.getElementById('sens_val').innerText=this.value">
-            <br><small>Lower = more sensitive (hand wave triggers)</small></p>
-            
-            <p><label>Clip Length: <span id="clip_val">{CLIP_SECONDS}</span>s</label><br>
-            <input type="range" name="clip_length" min="5" max="60" step="5" 
-                   value="{CLIP_SECONDS}" oninput="document.getElementById('clip_val').innerText=this.value">s</p>
-            
-            <p><label>Video Bitrate: <span id="bit_val">{VIDEO_BITRATE//1000000}</span>Mbps</label><br>
-            <input type="range" name="bitrate" min="5000000" max="20000000" step="1000000" 
-                   value="{VIDEO_BITRATE}" oninput="document.getElementById('bit_val').innerText=Math.round(this.value/1000000)+'M'">
-            <br><small>Higher = better quality (slower on Zero 2W)</small></p>
-            
-            <button type="submit" style="padding:12px 24px;font-size:18px">💾 Apply Settings</button>
-        </form>
-    </body>
-    </html>
-    '''
-    return html
 
 if __name__ == '__main__':
     logger.info("PiCam Motion Webcam (Gevent mode) starting on http://0.0.0.0:5000")
