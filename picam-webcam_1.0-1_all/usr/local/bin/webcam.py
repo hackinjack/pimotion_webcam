@@ -44,7 +44,6 @@ MOTION_ENABLED = True
 
 # Web config state (thread-safe)
 config_lock = Lock()
-load_config() # Call this immediately on startup
 os.makedirs(RECORDING_DIR, exist_ok=True)
 
 def load_config():
@@ -407,6 +406,9 @@ def download(filename):
 
 if __name__ == '__main__':
     logger.info("PiCam Motion Webcam (Gevent mode) starting on http://0.0.0.0:5000")
+
+    load_config() # Call this immediately on startup
+
     from gevent.pywsgi import WSGIServer
     import gevent
     import signal
