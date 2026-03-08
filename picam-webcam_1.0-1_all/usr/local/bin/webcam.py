@@ -7,6 +7,7 @@ import time
 import subprocess
 
 import shutil
+import json
 
 # --- PRE-INIT CLEANUP ---
 # Forcibly clear any ghost libcamera processes holding /dev/video0 BEFORE importing picamera2
@@ -36,12 +37,41 @@ app = Flask(__name__)
 MOTION_THRESHOLD = 1500000    # pixels changed (500k-5M)
 CLIP_SECONDS = 10             # recording duration (5-60s)
 VIDEO_BITRATE = 10000000      # MP4 quality (5M-20M)
-MOTION_ENABLED = True
 RECORDING_DIR = '/home/jfk/videos'
+CONFIG_FILE = '/home/jfk/webcam_config.json'
+MOTION_ENABLED = True
+
 
 # Web config state (thread-safe)
 config_lock = Lock()
 os.makedirs(RECORDING_DIR, exist_ok=True)
+
+def load_config():
+    global MOTION_THRESHOLD, CLIP_SECONDS, VIDEO_BITRATE, MOTION_ENABLED
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                data = json.load(f)
+                MOTION_THRESHOLD = data.get("MOTION_THRESHOLD", MOTION_THRESHOLD)
+                CLIP_SECONDS = data.get("CLIP_SECONDS", CLIP_SECONDS)
+                VIDEO_BITRATE = data.get("VIDEO_BITRATE", VIDEO_BITRATE)
+                MOTION_ENABLED = data.get("MOTION_ENABLED", MOTION_ENABLED)
+                logger.info("Loaded persistent configuration.")
+        except Exception as e:
+            logger.error(f"Failed to load config: {e}")
+
+def save_config():
+    with config_lock:
+        data = {
+            "MOTION_THRESHOLD": MOTION_THRESHOLD,
+            "CLIP_SECONDS": CLIP_SECONDS,
+            "VIDEO_BITRATE": VIDEO_BITRATE,
+            "MOTION_ENABLED": MOTION_ENABLED
+        }
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
+
+
 
 # ----------------------------------------------------------------------
 # 1. Thread-safe Streaming Output Class
@@ -242,6 +272,7 @@ def config():
             CLIP_SECONDS = int(request.form.get('clip_length', CLIP_SECONDS))
             VIDEO_BITRATE = int(request.form.get('bitrate', VIDEO_BITRATE))
         logger.info(f"CONFIG: sensitivity={MOTION_THRESHOLD}, clip={CLIP_SECONDS}s, bitrate={VIDEO_BITRATE}")
+        save_config()
     
     cpu_temp, disk_free = get_sys_status()
     
@@ -280,6 +311,7 @@ def toggle():
     global MOTION_ENABLED
     MOTION_ENABLED = not MOTION_ENABLED
     logger.info(f"[WEB] Motion toggled {'ON' if MOTION_ENABLED else 'OFF'}")
+    save_config()
     return 'OK'
 
 @app.route('/videos')
@@ -374,6 +406,9 @@ def download(filename):
 
 if __name__ == '__main__':
     logger.info("PiCam Motion Webcam (Gevent mode) starting on http://0.0.0.0:5000")
+
+    load_config() # Call this immediately on startup
+
     from gevent.pywsgi import WSGIServer
     import gevent
     import signal
