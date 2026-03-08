@@ -149,6 +149,8 @@ def start_recording():
     logger.info(f"[MOTION] Recording MP4 started: {filename}")
     time.sleep(clip_length)
     camera.stop_encoder(encoder)
+    # immediate cloud sync after each clip
+    os.system(f'rclone copy "{filename}" gdrive:PiCam/ --progress')
     logger.info(f"[MOTION] MP4 Recording finished: {filename}")
     is_recording = False
 
@@ -173,20 +175,29 @@ def motion_worker():
                 continue
 
             with config_lock:
-                threshold = MOTION_THRESHOLD
+                base_threshold = MOTION_THRESHOLD
                   
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray = cv2.GaussianBlur(gray, (21, 21), 0)
             
+                        # --- DYNAMIC THRESHOLD LOGIC ---
+            global current_brightness
+            current_brightness = np.mean(gray)
+            active_threshold = base_threshold
+
+            # If image is dark (heavy sensor noise), double the required threshold
+            if current_brightness < 50:
+                active_threshold = base_threshold * 2
+
             if prev_gray is not None:
                 frame_delta = cv2.absdiff(prev_gray, gray)
                 thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
                 motion_score = int(thresh.sum())
-                
-                if MOTION_ENABLED and motion_score > threshold:
+
+                if MOTION_ENABLED and motion_score > active_threshold:
                     threading.Thread(target=start_recording, daemon=True).start()
-                    logger.info(f"[MOTION] Detected: {motion_score} (threshold: {threshold})")
-            
+                    logger.info(f"[MOTION] Score: {motion_score} (Thresh: {active_threshold}, Light: {int(current_brightness)})")
+#
             prev_gray = gray
         except Exception as e:
             logger.error(f"Motion processing error: {e}")
