@@ -29,7 +29,7 @@ The easiest way to install is by building and using the Debian package, which au
 Clone the repository and build the `.deb` file:
 
 bash
-git clone https://github.com/yourusername/picam-webcam.git
+git clone https://github.com/hackinjack/picam-webcam.git
 cd picam-webcam
 dpkg-deb --build picam-webcam_1.0-1_all
 
