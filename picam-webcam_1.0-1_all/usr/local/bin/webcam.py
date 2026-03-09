@@ -150,7 +150,7 @@ def start_recording():
     time.sleep(clip_length)
     camera.stop_encoder(encoder)
     # immediate cloud sync after each clip
-    os.system(f'rclone copy "{filename}" gdrive:PiCam/ --progress')
+    os.system(f'rclone copy "{filename}" PiCam1:PiCam1/ --progress')
     logger.info(f"[MOTION] MP4 Recording finished: {filename}")
     is_recording = False
 
