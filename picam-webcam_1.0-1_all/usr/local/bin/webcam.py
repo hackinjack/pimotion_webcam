@@ -25,10 +25,18 @@ import cv2
 import numpy as np
 import logging
 
+# SSL & Auth
+from functools import wraps
+from werkzeug.security import check_password_hash
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# Auth
+AUTH_USERNAME = "admin"
+AUTH_PASSWORD_HASH = "pbkdf2:sha256:150000$8vt9qhg9NVcrgXpW$fc93fd73bd1a1b2be69525c3b0c514a6e2e18105b61b2af903b3e2edd11b7652"
 
 # Config - tune these
 MOTION_THRESHOLD = 1500000    # pixels changed (500k-5M)
@@ -178,7 +186,21 @@ def gen_frames():
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
+def check_auth(username, password):
+    # check_password_hash automatically salts and compares the plain text input to the hash
+    return username == AUTH_USERNAME and check_password_hash(AUTH_PASSWORD_HASH, password)
+
+def requires_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return Response('Login Required', 401, {'WWW-Authenticate': 'Basic realm="Login Required"'})
+        return f(*args, **kwargs)
+    return decorated
+
 @app.route('/')
+@requires_auth
 def index():
     status = "ON" if MOTION_ENABLED else "OFF"
     return render_template_string(f'''
@@ -207,10 +229,12 @@ def index():
     ''')
 
 @app.route('/video_feed')
+@requires_auth
 def video_feed():
     return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/toggle')
+@requires_auth
 def toggle():
     global MOTION_ENABLED
     MOTION_ENABLED = not MOTION_ENABLED
@@ -218,6 +242,7 @@ def toggle():
     return 'OK'
 
 @app.route('/videos')
+@requires_auth
 def list_videos():
     videos = []
     for filename in sorted(os.listdir(RECORDING_DIR), reverse=True)[:50]:
@@ -304,10 +329,12 @@ def list_videos():
     return html
 
 @app.route('/download/<filename>')
+@requires_auth
 def download(filename):
     return send_from_directory(RECORDING_DIR, filename, as_attachment=True, download_name=filename)
 
 @app.route('/config', methods=['GET', 'POST'])
+@requires_auth
 def config():
     global MOTION_THRESHOLD, CLIP_SECONDS, VIDEO_BITRATE
     
@@ -350,12 +377,34 @@ def config():
     return html
 
 if __name__ == '__main__':
-    logger.info("PiCam Motion Webcam (Gevent mode) starting on http://0.0.0.0:5000")
+    logger.info("PiCam Motion Webcam (Gevent mode) starting on https://0.0.0.0:5000")
     from gevent.pywsgi import WSGIServer
     import gevent
     import signal
-
-    server = WSGIServer(('0.0.0.0', 5000), app)
+    import ssl
+# Explicitly create the SSL context
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    logger.info("SSL context created")
+    
+    try:
+        # Load your Let's Encrypt certificates
+        context.load_cert_chain(
+            keyfile='/etc/letsencrypt/live/picam1.thirteenb.mywire.org/privkey.pem',
+            certfile='/etc/letsencrypt/live/picam1.thirteenb.mywire.org/fullchain.pem'
+            )
+    except PermissionError:
+        logger.error("CRITICAL: Python does not have permission to read the Let's Encrypt certificates!")
+        exit(1)
+    except Exception as e:
+        logger.error(f"CRITICAL: SSL Context failed to load: {e}")
+        exit(1)    
+# Pass the context directly to the WSGIServer
+    logger.info("Starting up")
+    server = WSGIServer(('0.0.0.0', 5000), 
+                        app,
+                        ssl_context=context
+    )
+    logger.info("Flask webserver up")
 
     def shutdown():
         logger.info("Shutting down... releasing camera.")
