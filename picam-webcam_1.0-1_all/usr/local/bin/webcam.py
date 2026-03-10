@@ -6,6 +6,9 @@ import os
 import time
 import subprocess
 
+import shutil
+import json
+
 # --- PRE-INIT CLEANUP ---
 # Forcibly clear any ghost libcamera processes holding /dev/video0 BEFORE importing picamera2
 try:
@@ -42,12 +45,41 @@ AUTH_PASSWORD_HASH = "pbkdf2:sha256:150000$8vt9qhg9NVcrgXpW$fc93fd73bd1a1b2be695
 MOTION_THRESHOLD = 1500000    # pixels changed (500k-5M)
 CLIP_SECONDS = 10             # recording duration (5-60s)
 VIDEO_BITRATE = 10000000      # MP4 quality (5M-20M)
-MOTION_ENABLED = True
 RECORDING_DIR = '/home/jfk/videos'
+CONFIG_FILE = '/home/jfk/webcam_config.json'
+MOTION_ENABLED = True
+
 
 # Web config state (thread-safe)
 config_lock = Lock()
 os.makedirs(RECORDING_DIR, exist_ok=True)
+
+def load_config():
+    global MOTION_THRESHOLD, CLIP_SECONDS, VIDEO_BITRATE, MOTION_ENABLED
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                data = json.load(f)
+                MOTION_THRESHOLD = data.get("MOTION_THRESHOLD", MOTION_THRESHOLD)
+                CLIP_SECONDS = data.get("CLIP_SECONDS", CLIP_SECONDS)
+                VIDEO_BITRATE = data.get("VIDEO_BITRATE", VIDEO_BITRATE)
+                MOTION_ENABLED = data.get("MOTION_ENABLED", MOTION_ENABLED)
+                logger.info("Loaded persistent configuration.")
+        except Exception as e:
+            logger.error(f"Failed to load config: {e}")
+
+def save_config():
+    with config_lock:
+        data = {
+            "MOTION_THRESHOLD": MOTION_THRESHOLD,
+            "CLIP_SECONDS": CLIP_SECONDS,
+            "VIDEO_BITRATE": VIDEO_BITRATE,
+            "MOTION_ENABLED": MOTION_ENABLED
+        }
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
+
+
 
 # ----------------------------------------------------------------------
 # 1. Thread-safe Streaming Output Class
@@ -125,6 +157,8 @@ def start_recording():
     logger.info(f"[MOTION] Recording MP4 started: {filename}")
     time.sleep(clip_length)
     camera.stop_encoder(encoder)
+    # immediate cloud sync after each clip
+    os.system(f'rclone copy "{filename}" PiCam1:PiCam1/ --progress')
     logger.info(f"[MOTION] MP4 Recording finished: {filename}")
     is_recording = False
 
@@ -149,20 +183,29 @@ def motion_worker():
                 continue
 
             with config_lock:
-                threshold = MOTION_THRESHOLD
+                base_threshold = MOTION_THRESHOLD
                   
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray = cv2.GaussianBlur(gray, (21, 21), 0)
             
+                        # --- DYNAMIC THRESHOLD LOGIC ---
+            global current_brightness
+            current_brightness = np.mean(gray)
+            active_threshold = base_threshold
+
+            # If image is dark (heavy sensor noise), double the required threshold
+            if current_brightness < 50:
+                active_threshold = base_threshold * 2
+
             if prev_gray is not None:
                 frame_delta = cv2.absdiff(prev_gray, gray)
                 thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
                 motion_score = int(thresh.sum())
-                
-                if MOTION_ENABLED and motion_score > threshold:
+
+                if MOTION_ENABLED and motion_score > active_threshold:
                     threading.Thread(target=start_recording, daemon=True).start()
-                    logger.info(f"[MOTION] Detected: {motion_score} (threshold: {threshold})")
-            
+                    logger.info(f"[MOTION] Score: {motion_score} (Thresh: {active_threshold}, Light: {int(current_brightness)})")
+#
             prev_gray = gray
         except Exception as e:
             logger.error(f"Motion processing error: {e}")
@@ -170,6 +213,21 @@ def motion_worker():
         time.sleep(0.2)  # Throttle to ~5fps for motion analysis to save CPU
 
 threading.Thread(target=motion_worker, daemon=True).start()
+
+# ======================================================================
+# DASHBOARD LOGIC
+# ======================================================================
+current_brightness = 100 # Placeholder for Stage 3
+
+def get_sys_status():
+    """Gets CPU Temp and Disk Space for dashboard."""
+    try:
+        temp = os.popen("vcgencmd measure_temp").readline().strip().replace("temp=","")
+    except:
+        temp = "N/A"
+    total, used, free = shutil.disk_usage("/")
+    free_gb = free // (2**30)
+    return temp, free_gb
 
 # ----------------------------------------------------------------------
 # 4. Flask Web Routes
@@ -207,26 +265,75 @@ def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>RPi Zero 2W PiCam Motion Webcam</title>
-        <style>body{{font-family:Arial}} button{{padding:10px;font-size:18px}}</style>
+        <title>PiCam Security</title>
+        <style>
+            body {{ font-family: Arial; background: #222; color: white; text-align: center; margin: 0; padding: 20px; }}
+            .video-container {{ position: relative; display: inline-block; border: 3px solid #444; border-radius: 8px; overflow: hidden; }}
+            .timestamp {{ position: absolute; bottom: 10px; right: 15px; color: yellow; font-size: 20px; font-weight: bold; background: rgba(0,0,0,0.5); padding: 2px 8px; border-radius: 4px; font-family: monospace; }}
+            button, .btn {{ padding: 10px 15px; font-size: 16px; margin: 5px; cursor: pointer; text-decoration: none; color: black; background: #ddd; border-radius: 5px; }}
+        </style>
     </head>
     <body>
-        <h1>RPi Zero 2W PiCam Motion Webcam</h1>
-        <img src="/video_feed" width="640" height="480">
+        <h2>🛡️ PiCam Zero 2W</h2>
+        <div class="video-container">
+            <img src="/video_feed" width="640" height="480">
+            <div class="timestamp" id="clock"></div>
+        </div>
         <br><br>
-        <button onclick="toggleMotion()">Motion Detection: <span id="status">{status}</span></button>
-        <a href="/config" style="color:blue;font-size:18px;margin-left:20px">⚙️ Config</a>
-
-        <p>Threshold: {MOTION_THRESHOLD} | Videos: <a href="/videos">[List Recordings]</a></p>
+        <button onclick="fetch('/toggle').then(()=>location.reload())">Motion: {status}</button>
+        <a href="/config" class="btn">⚙️ Settings</a>
+        <a href="/videos" class="btn">📹 Recordings</a>
+        
         <script>
-        async function toggleMotion() {{
-            const res = await fetch('/toggle');
-            if (res.ok) location.reload();
-        }}
+            // Live JS Clock for Overlay
+            setInterval(() => {{
+                let d = new Date();
+                document.getElementById('clock').innerText = d.toISOString().replace('T', ' ').substring(0, 19);
+            }}, 1000);
         </script>
     </body>
     </html>
     ''')
+
+@app.route('/config', methods=['GET', 'POST'])
+def config():
+    global MOTION_THRESHOLD, CLIP_SECONDS, VIDEO_BITRATE
+    
+    if request.method == 'POST':
+        with config_lock:
+            MOTION_THRESHOLD = int(request.form.get('sensitivity', MOTION_THRESHOLD))
+            CLIP_SECONDS = int(request.form.get('clip_length', CLIP_SECONDS))
+            VIDEO_BITRATE = int(request.form.get('bitrate', VIDEO_BITRATE))
+        logger.info(f"CONFIG: sensitivity={MOTION_THRESHOLD}, clip={CLIP_SECONDS}s, bitrate={VIDEO_BITRATE}")
+        save_config()
+    
+    cpu_temp, disk_free = get_sys_status()
+    
+    html = f'''
+    <!DOCTYPE html><html><head><title>Config</title><style>body{{font-family:Arial; margin:40px}}</style></head>
+    <body>
+        <h1>⚙️ Dashboard & Config</h1>
+        <a href="/">🏠 Live View</a><hr>
+        
+        <div style="background:#eee; color:black; padding:15px; border-radius:8px; margin-bottom:20px; width:400px;">
+            <h3>📊 System Status</h3>
+            <b>CPU Temp:</b> {cpu_temp}<br>
+            <b>SD Card Free:</b> {disk_free} GB<br>
+            <b>Light Level:</b> {int(current_brightness)}/255<br>
+        </div>
+
+        <form method="POST">
+            <p><b>Sensitivity (Threshold):</b> {MOTION_THRESHOLD}<br>
+            <input type="range" name="sensitivity" min="500000" max="5000000" step="100000" value="{MOTION_THRESHOLD}" style="width:300px"></p>
+            <p><b>Clip Length (sec):</b> {CLIP_SECONDS}<br>
+            <input type="range" name="clip_length" min="5" max="60" step="5" value="{CLIP_SECONDS}" style="width:300px"></p>
+            <p><b>Bitrate (bps):</b> {VIDEO_BITRATE}<br>
+            <input type="range" name="bitrate" min="5000000" max="20000000" step="1000000" value="{VIDEO_BITRATE}" style="width:300px"></p>
+            <button type="submit" style="padding:10px 20px; background:#4CAF50; color:white; border:none;">💾 Save Settings</button>
+        </form>
+    </body></html>
+    '''
+    return html
 
 @app.route('/video_feed')
 @requires_auth
@@ -239,6 +346,7 @@ def toggle():
     global MOTION_ENABLED
     MOTION_ENABLED = not MOTION_ENABLED
     logger.info(f"[WEB] Motion toggled {'ON' if MOTION_ENABLED else 'OFF'}")
+    save_config()
     return 'OK'
 
 @app.route('/videos')
