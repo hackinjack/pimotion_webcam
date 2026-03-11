@@ -8,14 +8,8 @@ import subprocess
 
 import shutil
 import json
-
-# --- PRE-INIT CLEANUP ---
-# Forcibly clear any ghost libcamera processes holding /dev/video0 BEFORE importing picamera2
-try:
-    subprocess.run(["fuser", "-k", "/dev/video0"], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-    time.sleep(1) # Let the V4L2 kernel driver unmap the memory
-except Exception:
-    pass
+from picamera2.outputs import FfmpegOutput
+from picamera2.encoders import H264Encoder
 
 from flask import Flask, Response, render_template_string, send_from_directory, request
 import picamera2
@@ -28,50 +22,61 @@ import cv2
 import numpy as np
 import logging
 
+# SSL & Auth
+from functools import wraps
+from werkzeug.security import check_password_hash
+from werkzeug.security import generate_password_hash
+
+# --- PRE-INIT CLEANUP ---
+# Forcibly clear any ghost libcamera processes holding /dev/video0 BEFORE importing picamera2
+try:
+    subprocess.run(["fuser", "-k", "/dev/video0"], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    time.sleep(1) # Let the V4L2 kernel driver unmap the memory
+except Exception:
+    pass
+
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Config - tune these
-MOTION_THRESHOLD = 1500000    # pixels changed (500k-5M)
-CLIP_SECONDS = 10             # recording duration (5-60s)
-VIDEO_BITRATE = 10000000      # MP4 quality (5M-20M)
+# Auth
+# Default Config (Including Auth)
 RECORDING_DIR = '/home/jfk/videos'
 CONFIG_FILE = '/home/jfk/webcam_config.json'
 MOTION_ENABLED = True
 
-
-# Web config state (thread-safe)
-config_lock = Lock()
-os.makedirs(RECORDING_DIR, exist_ok=True)
+config_data = {
+    "MOTION_THRESHOLD": 1500000,
+    "CLIP_SECONDS": 10,
+    "VIDEO_BITRATE": 10000000,
+    "MOTION_ENABLED": True,
+    "WEB_PORT": 8773,
+    "AUTH_USERNAME": "admin",
+    "AUTH_PASSWORD_HASH": "pbkdf2:sha256:150000$8vt9qhg9NVcrgXpW$fc93fd73bd1a1b2be69525c3b0c514a6e2e18105b61b2af903b3e2edd11b7652"
+}
 
 def load_config():
-    global MOTION_THRESHOLD, CLIP_SECONDS, VIDEO_BITRATE, MOTION_ENABLED
+    global config_data
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r') as f:
-                data = json.load(f)
-                MOTION_THRESHOLD = data.get("MOTION_THRESHOLD", MOTION_THRESHOLD)
-                CLIP_SECONDS = data.get("CLIP_SECONDS", CLIP_SECONDS)
-                VIDEO_BITRATE = data.get("VIDEO_BITRATE", VIDEO_BITRATE)
-                MOTION_ENABLED = data.get("MOTION_ENABLED", MOTION_ENABLED)
+                saved_data = json.load(f)
+                config_data.update(saved_data)
                 logger.info("Loaded persistent configuration.")
         except Exception as e:
             logger.error(f"Failed to load config: {e}")
 
 def save_config():
     with config_lock:
-        data = {
-            "MOTION_THRESHOLD": MOTION_THRESHOLD,
-            "CLIP_SECONDS": CLIP_SECONDS,
-            "VIDEO_BITRATE": VIDEO_BITRATE,
-            "MOTION_ENABLED": MOTION_ENABLED
-        }
         with open(CONFIG_FILE, 'w') as f:
-            json.dump(data, f, indent=4)
+            json.dump(config_data, f, indent=4)
 
 
+# Web config state (thread-safe)
+config_lock = Lock()
+os.makedirs(RECORDING_DIR, exist_ok=True)
 
 # ----------------------------------------------------------------------
 # 1. Thread-safe Streaming Output Class
@@ -96,11 +101,11 @@ class StreamingBuffer(io.BufferedIOBase):
             
             # Keep whatever bytes came after this frame for the next loop
             self.buffer = self.buffer[b+2:]
-            
+
             with self.condition:
                 self.frame = completed_frame
                 self.condition.notify_all()
-                
+
         return len(buf)
 
 # Initialize the global streaming buffer
@@ -134,13 +139,13 @@ def start_recording():
             return
         is_recording = True
 
+# READ FROM config_data INSTEAD OF GLOBAL VARIABLES
     with config_lock:
-        clip_length = CLIP_SECONDS
+        clip_length = config_data.get("CLIP_SECONDS", 10)
+        current_bitrate = config_data.get("VIDEO_BITRATE", 10000000)
 
     timestamp = time.strftime('%Y%m%d-%H%M%S')
     filename = f'{RECORDING_DIR}/motion_{timestamp}.mp4'
-    from picamera2.outputs import FfmpegOutput
-    from picamera2.encoders import H264Encoder
 
     output = FfmpegOutput(filename)
     encoder = H264Encoder(bitrate=VIDEO_BITRATE) 
@@ -175,7 +180,7 @@ def motion_worker():
                 continue
 
             with config_lock:
-                base_threshold = MOTION_THRESHOLD
+                base_threshold = config_data.get("MOTION_THRESHOLD", 1500000)
                   
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray = cv2.GaussianBlur(gray, (21, 21), 0)
@@ -236,9 +241,36 @@ def gen_frames():
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
+# ======================================================================
+# BASIC AUTHENTICATION
+# ======================================================================
+def check_auth(username, password):
+    try:
+        saved_username = config_data.get("AUTH_USERNAME", "admin")
+        saved_hash = config_data.get("AUTH_PASSWORD_HASH", "")
+
+        return username == saved_username and check_password_hash(saved_hash, password)
+    except ValueError as e:
+        logger.error(f"Hash validation error: {e}")
+        return False
+
+def requires_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return Response('Login Required', 401, {'WWW-Authenticate': 'Basic realm="Login Required"'})
+        return f(*args, **kwargs)
+    return decorated
+
 @app.route('/')
 def index():
+    global current_brightness
     status = "ON" if MOTION_ENABLED else "OFF"
+
+    # Grab the latest system metrics
+    cpu_temp, disk_free = get_sys_status()
+
     return render_template_string(f'''
     <!DOCTYPE html>
     <html>
@@ -253,6 +285,13 @@ def index():
     </head>
     <body>
         <h2>🛡️ PiCam Zero 2W</h2>
+            <div class="status-bar">
+                🌡️ Temp: <b>{cpu_temp}</b> &nbsp;|&nbsp;
+                💾 SD Free: <b>{disk_free} GB</b> &nbsp;|&nbsp;
+                ☀️ Light: <b>{int(current_brightness)}/255</b>
+        </div>
+
+        <br><br>
         <div class="video-container">
             <img src="/video_feed" width="640" height="480">
             <div class="timestamp" id="clock"></div>
@@ -274,24 +313,43 @@ def index():
     ''')
 
 @app.route('/config', methods=['GET', 'POST'])
+@requires_auth
 def config():
-    global MOTION_THRESHOLD, CLIP_SECONDS, VIDEO_BITRATE
+    global config_data
+    update_msg = ""
     
     if request.method == 'POST':
         with config_lock:
-            MOTION_THRESHOLD = int(request.form.get('sensitivity', MOTION_THRESHOLD))
-            CLIP_SECONDS = int(request.form.get('clip_length', CLIP_SECONDS))
-            VIDEO_BITRATE = int(request.form.get('bitrate', VIDEO_BITRATE))
-        logger.info(f"CONFIG: sensitivity={MOTION_THRESHOLD}, clip={CLIP_SECONDS}s, bitrate={VIDEO_BITRATE}")
+            # Update camera settings
+            config_data["MOTION_THRESHOLD"] = int(request.form.get('sensitivity', config_data["MOTION_THRESHOLD"]))
+            config_data["CLIP_SECONDS"] = int(request.form.get('clip_length', config_data["CLIP_SECONDS"]))
+            config_data["VIDEO_BITRATE"] = int(request.form.get('bitrate', config_data["VIDEO_BITRATE"]))
+            config_data["WEB_PORT"] = int(request.form.get('web_port', config_data.get("WEB_PORT", 8773)))
+            
+            # Handle credential updates if provided
+            new_user = request.form.get('new_username', '').strip()
+            new_pass = request.form.get('new_password', '').strip()
+            
+            if new_user and new_pass:
+                config_data["AUTH_USERNAME"] = new_user
+                # Safely generate a new hash using pbkdf2 to avoid OpenSSL errors
+                config_data["AUTH_PASSWORD_HASH"] = generate_password_hash(new_pass, method='pbkdf2:sha256:150000')
+                update_msg = f"<p style='color:green; font-weight:bold;'>Credentials updated for {new_user}! Please refresh to login.</p>"
+                
         save_config()
+        logger.info("Config and/or credentials updated and saved.")
+        if not update_msg:
+            update_msg = "<p style='color:green; font-weight:bold;'>Settings Saved Successfully!</p>"
     
     cpu_temp, disk_free = get_sys_status()
+    current_port = config_data.get("WEB_PORT", 5000)
     
     html = f'''
     <!DOCTYPE html><html><head><title>Config</title><style>body{{font-family:Arial; margin:40px}}</style></head>
     <body>
         <h1>⚙️ Dashboard & Config</h1>
         <a href="/">🏠 Live View</a><hr>
+        {update_msg}
         
         <div style="background:#eee; color:black; padding:15px; border-radius:8px; margin-bottom:20px; width:400px;">
             <h3>📊 System Status</h3>
@@ -301,23 +359,38 @@ def config():
         </div>
 
         <form method="POST">
-            <p><b>Sensitivity (Threshold):</b> {MOTION_THRESHOLD}<br>
-            <input type="range" name="sensitivity" min="500000" max="5000000" step="100000" value="{MOTION_THRESHOLD}" style="width:300px"></p>
-            <p><b>Clip Length (sec):</b> {CLIP_SECONDS}<br>
-            <input type="range" name="clip_length" min="5" max="60" step="5" value="{CLIP_SECONDS}" style="width:300px"></p>
-            <p><b>Bitrate (bps):</b> {VIDEO_BITRATE}<br>
-            <input type="range" name="bitrate" min="5000000" max="20000000" step="1000000" value="{VIDEO_BITRATE}" style="width:300px"></p>
-            <button type="submit" style="padding:10px 20px; background:#4CAF50; color:white; border:none;">💾 Save Settings</button>
+            <h3>Camera Settings</h3>
+            <p><b>Sensitivity (Threshold):</b> {config_data["MOTION_THRESHOLD"]}<br>
+            <input type="range" name="sensitivity" min="500000" max="5000000" step="100000" value="{config_data["MOTION_THRESHOLD"]}" style="width:300px"></p>
+            <p><b>Clip Length (sec):</b> {config_data["CLIP_SECONDS"]}<br>
+            <input type="range" name="clip_length" min="5" max="60" step="5" value="{config_data["CLIP_SECONDS"]}" style="width:300px"></p>
+            <p><b>Bitrate (bps):</b> {config_data["VIDEO_BITRATE"]}<br>
+            <hr>
+            <h3>Network Settings</h3>
+            <p><b>Web UI Port:</b><br>
+            <input type="number" name="web_port" min="1024" max="65535" value="{current_port}" style="width:150px"></p>
+            <p style="font-size:12px; color:#555;"><i>Note: Changing the port requires restarting the camera service in the terminal for the change to take effect.</i></p>
+            <input type="range" name="bitrate" min="5000000" max="20000000" step="1000000" value="{config_data["VIDEO_BITRATE"]}" style="width:300px"></p>
+            
+            <hr>
+            <h3>Security Settings</h3>
+            <p><i>Leave blank to keep current credentials</i></p>
+            <p><b>New Username:</b><br><input type="text" name="new_username" placeholder="admin"></p>
+            <p><b>New Password:</b><br><input type="password" name="new_password" placeholder="New secret password"></p>
+            
+            <button type="submit" style="padding:10px 20px; background:#4CAF50; color:white; border:none; margin-top:15px;">💾 Save All Settings</button>
         </form>
     </body></html>
     '''
     return html
 
 @app.route('/video_feed')
+@requires_auth
 def video_feed():
     return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/toggle')
+@requires_auth
 def toggle():
     global MOTION_ENABLED
     MOTION_ENABLED = not MOTION_ENABLED
@@ -326,6 +399,7 @@ def toggle():
     return 'OK'
 
 @app.route('/videos')
+@requires_auth
 def list_videos():
     videos = []
     for filename in sorted(os.listdir(RECORDING_DIR), reverse=True)[:50]:
@@ -412,19 +486,43 @@ def list_videos():
     return html
 
 @app.route('/download/<filename>')
+@requires_auth
 def download(filename):
     return send_from_directory(RECORDING_DIR, filename, as_attachment=True, download_name=filename)
 
 if __name__ == '__main__':
-    logger.info("PiCam Motion Webcam (Gevent mode) starting on http://0.0.0.0:5000")
+    # Important: Load config FIRST to ensure we get the saved WEB_PORT
+    load_config()
+    current_port = config_data.get("WEB_PORT", 8773)
 
-    load_config() # Call this immediately on startup
-
+    logger.info(f"PiCam Motion Webcam (Gevent mode) starting on https://0.0.0.0:{current_port}")
     from gevent.pywsgi import WSGIServer
     import gevent
     import signal
-
-    server = WSGIServer(('0.0.0.0', 5000), app)
+    import ssl
+# Explicitly create the SSL context
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    logger.info("SSL context created")
+    
+    try:
+        # Load your Let's Encrypt certificates
+        context.load_cert_chain(
+            keyfile='/etc/letsencrypt/live/picam1.thirteenb.mywire.org/privkey.pem',
+            certfile='/etc/letsencrypt/live/picam1.thirteenb.mywire.org/fullchain.pem'
+            )
+    except PermissionError:
+        logger.error("CRITICAL: Python does not have permission to read the Let's Encrypt certificates!")
+        exit(1)
+    except Exception as e:
+        logger.error(f"CRITICAL: SSL Context failed to load: {e}")
+        exit(1)    
+# Pass the context directly to the WSGIServer
+    logger.info("Starting up")
+    server = WSGIServer(('0.0.0.0', 8773), 
+                        app,
+                        ssl_context=context
+    )
+    logger.info("Flask webserver up")
 
     def shutdown():
         logger.info("Shutting down... releasing camera.")
