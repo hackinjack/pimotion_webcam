@@ -140,23 +140,34 @@ def start_recording():
         is_recording = True
 
 # READ FROM config_data INSTEAD OF GLOBAL VARIABLES
-    with config_lock:
-        clip_length = config_data.get("CLIP_SECONDS", 10)
-        current_bitrate = config_data.get("VIDEO_BITRATE", 10000000)
+    try:
+        with config_lock:
+            clip_length = config_data.get("CLIP_SECONDS", 10)
+            current_bitrate = config_data.get("VIDEO_BITRATE", 10000000)
 
-    timestamp = time.strftime('%Y%m%d-%H%M%S')
-    filename = f'{RECORDING_DIR}/motion_{timestamp}.mp4'
+        timestamp = time.strftime('%Y%m%d-%H%M%S')
+        filename = f'{RECORDING_DIR}/motion_{timestamp}.mp4'
 
-    output = FfmpegOutput(filename)
-    encoder = H264Encoder(bitrate=VIDEO_BITRATE) 
+        output = FfmpegOutput(filename)
+        encoder = H264Encoder(current_bitrate) 
     
-    camera.start_encoder(encoder, output)
-    logger.info(f"[MOTION] Recording MP4 started: {filename}")
-    time.sleep(clip_length)
-    camera.stop_encoder(encoder)
+        camera.start_encoder(encoder, output)
+        logger.info(f"[MOTION] Recording MP4 started: {filename}")
+        time.sleep(clip_length)
+        camera.stop_encoder(encoder)
     # immediate cloud sync after each clip
-    os.system(f'rclone copy "{filename}" PiCam1:PiCam1/ --progress')
-    logger.info(f"[MOTION] MP4 Recording finished: {filename}")
+    # Trigger rclone asynchronously (non-blocking) so it doesn't freeze the recording thread
+        subprocess.Popen(
+            f'rclone copy "{filename}" PiCam1:PiCam1/ --progress',
+            shell=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+    except Exception as e:
+        logger.error(f"[MOTION] Critical error during recording: {e}")
+        os.system(f'rclone copy "{filename}" PiCam1:PiCam1/ --progress')
+        logger.info(f"[MOTION] MP4 Recording finished: {filename}")
     is_recording = False
 
 def motion_worker():
@@ -500,6 +511,16 @@ if __name__ == '__main__':
     import gevent
     import signal
     import ssl
+    import logging
+
+    # Create a custom logger that ignores the SSLEOFError tracebacks
+    class QuietGeventLogger(logging.Logger):
+        def write(self, msg):
+            if "EOF occurred in violation of protocol" not in msg and "SSLEOFError" not in msg:
+                logger.error(msg.strip())
+
+    quiet_logger = QuietGeventLogger("QuietGevent")
+
 # Explicitly create the SSL context
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     logger.info("SSL context created")
@@ -518,7 +539,7 @@ if __name__ == '__main__':
         exit(1)    
 # Pass the context directly to the WSGIServer
     logger.info("Starting up")
-    server = WSGIServer(('0.0.0.0', 8773), 
+    server = WSGIServer(('::', 8773), 
                         app,
                         ssl_context=context
     )
