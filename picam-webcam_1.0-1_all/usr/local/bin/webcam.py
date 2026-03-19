@@ -302,43 +302,147 @@ def requires_auth(f):
         return f(*args, **kwargs)
     return decorated
 
+@app.route('/sys_cmd/<action>')
+@requires_auth
+def sys_cmd(action):
+    if action == 'restart_cam':
+        logger.info("[WEB] Manual camera service restart requested.")
+        # Run in background so Flask can return the redirect page before the service dies
+        threading.Thread(target=lambda: os.system("sudo systemctl restart webcam"), daemon=True).start()
+        msg = "Restarting Camera Service... Please wait."
+        delay = 10
+    elif action == 'reboot':
+        logger.info("[WEB] Manual system reboot requested.")
+        threading.Thread(target=lambda: os.system("sudo reboot"), daemon=True).start()
+        msg = "Rebooting Raspberry Pi... Please wait a minute."
+        delay = 60
+    else:
+        return "Invalid action", 400
+
+    return f'''
+    <!DOCTYPE html><html><head>
+    <meta http-equiv="refresh" content="{delay};url=/" />
+    <style>body {{ font-family: Arial; background: #222; color: white; text-align: center; margin-top: 100px; }}</style>
+    </head><body><h2>⚙️ {msg}</h2><p>You will be redirected automatically...</p></body></html>
+    '''
+
+@app.route('/logs')
+@requires_auth
+def view_logs():
+    try:
+        # Grabs the last 150 lines of the webcam systemd service logs
+        logs = subprocess.check_output(['journalctl', '-u', 'webcam', '-n', '150', '--no-pager']).decode('utf-8')
+    except Exception as e:
+        logs = f"Error fetching logs: {e}"
+        
+    return f'''
+    <!DOCTYPE html>
+    <html>
+    <head><title>System Logs</title><style>body {{ background: #1e1e1e; color: #00ff00; font-family: monospace; padding: 20px; }}</style></head>
+    <body>
+        <h2>📜 Live System Logs</h2>
+        <a href="/" style="background:#555; color:white; padding:8px 12px; text-decoration:none; border-radius:4px; margin-right:10px;">🏠 Home</a>
+        <a href="/logs" style="background:#2196F3; color:white; padding:8px 12px; text-decoration:none; border-radius:4px;">🔄 Refresh Logs</a>
+        <hr style="border-color:#444; margin: 20px 0;">
+        <pre style="white-space: pre-wrap; word-wrap: break-word;">{logs}</pre>
+    </body>
+    </html>
+    '''
 @app.route('/')
 def index():
     global current_brightness
     status = "ON" if MOTION_ENABLED else "OFF"
-
-    # Grab the latest system metrics
     cpu_temp, disk_free = get_sys_status()
+    
+    # Generate the HTML for the scrollable recent clips (last 25 clips)
+    clips_html = ""
+    try:
+        recent_files = sorted(os.listdir(RECORDING_DIR), reverse=True)[:25]
+        for f in recent_files:
+            if f.endswith('.mp4'):
+                # Creates a neat downloadable link for each clip
+                clips_html += f'<li style="margin-bottom: 8px; font-family: monospace;"><a href="/download/{f}" style="color: #4CAF50; text-decoration: none;">▶ {f}</a></li>'
+        if not clips_html:
+            clips_html = "<li style='color: #aaa;'>No clips found.</li>"
+    except Exception:
+        clips_html = "<li style='color: red;'>Error reading directory</li>"
 
-    return render_template_string(f'''
+    # NOTE: Replace the GDrive URL below with your actual shared Drive link
+    GDRIVE_URL = "https://drive.google.com/drive/my-drive"
+
+    return f'''
     <!DOCTYPE html>
     <html>
     <head>
         <title>PiCam Security</title>
         <style>
             body {{ font-family: Arial; background: #222; color: white; text-align: center; margin: 0; padding: 20px; }}
+            
+            /* Flexbox layout for Side-by-Side */
+            .main-layout {{ display: flex; justify-content: center; align-items: flex-start; gap: 20px; flex-wrap: wrap; margin-top: 20px; }}
+            .camera-section {{ display: flex; flex-direction: column; align-items: center; }}
+            
+            /* Video and Status */
             .video-container {{ position: relative; display: inline-block; border: 3px solid #444; border-radius: 8px; overflow: hidden; }}
             .timestamp {{ position: absolute; bottom: 10px; right: 15px; color: yellow; font-size: 20px; font-weight: bold; background: rgba(0,0,0,0.5); padding: 2px 8px; border-radius: 4px; font-family: monospace; }}
-            button, .btn {{ padding: 10px 15px; font-size: 16px; margin: 5px; cursor: pointer; text-decoration: none; color: black; background: #ddd; border-radius: 5px; }}
+            .status-bar {{ background: #333; padding: 10px 20px; border-radius: 5px; margin: 15px 0; display: inline-block; font-size: 14px; color: #aaa; border: 1px solid #444; }}
+            .status-bar b {{ color: #fff; }}
+            
+            /* Buttons */
+            .btn-group {{ margin-bottom: 15px; }}
+            button, .btn {{ padding: 10px 15px; font-size: 14px; margin: 5px; cursor: pointer; text-decoration: none; border-radius: 5px; border: none; font-weight: bold; display: inline-block; }}
+            .btn-default {{ background: #ddd; color: black; }}
+            .btn-gdrive {{ background: #4285F4; color: white; }}
+            .btn-log {{ background: #9c27b0; color: white; }}
+            .btn-warn {{ background: #FF9800; color: white; }}
+            .btn-danger {{ background: #f44336; color: white; }}
+            button:hover, .btn:hover {{ opacity: 0.8; }}
+
+            /* Right Hand Side Clips Panel */
+            .rhs-panel {{ width: 280px; background: #333; padding: 15px; border-radius: 8px; text-align: left; max-height: 520px; overflow-y: auto; border: 1px solid #444; }}
+            .rhs-panel h3 {{ margin-top: 0; border-bottom: 1px solid #555; padding-bottom: 10px; font-size: 18px; }}
+            .rhs-panel ul {{ list-style: none; padding: 0; margin: 0; }}
         </style>
     </head>
     <body>
         <h2>🛡️ PiCam Zero 2W</h2>
-            <div class="status-bar">
-                🌡️ Temp: <b>{cpu_temp}</b> &nbsp;|&nbsp;
-                💾 SD Free: <b>{disk_free} GB</b> &nbsp;|&nbsp;
-                ☀️ Light: <b>{int(current_brightness)}/255</b>
-        </div>
+        
+        <div class="main-layout">
+            <!-- LEFT SIDE: Camera & Controls -->
+            <div class="camera-section">
+                <div class="video-container">
+                    <img src="/video_feed" width="640" height="480">
+                    <div class="timestamp" id="clock"></div>
+                </div>
+                
+                <div class="status-bar">
+                    🌡️ Temp: <b>{cpu_temp}</b> &nbsp;|&nbsp; 
+                    💾 SD Free: <b>{disk_free} GB</b> &nbsp;|&nbsp; 
+                    ☀️ Light: <b>{int(current_brightness)}/255</b>
+                </div>
+                
+                <div class="btn-group">
+                    <button class="btn-default" onclick="fetch('/toggle').then(()=>location.reload())">🏃 Motion: {status}</button>
+                    <a href="/config" class="btn btn-default">⚙️ Settings</a>
+                    <a href="/videos" class="btn btn-default">📹 All Videos</a>
+                    <a href="{GDRIVE_URL}" target="_blank" class="btn btn-gdrive">☁️ GDrive</a>
+                </div>
+                
+                <div class="btn-group" style="border-top: 1px solid #444; padding-top: 15px;">
+                    <a href="/logs" class="btn btn-log">📜 View Logs</a>
+                    <button class="btn-warn" onclick="if(confirm('Restart camera service? This takes 10 seconds.')) window.location.href='/sys_cmd/restart_cam'">🔄 Restart Service</button>
+                    <button class="btn-danger" onclick="if(confirm('Are you sure you want to REBOOT the Pi?')) window.location.href='/sys_cmd/reboot'">🔴 Reboot Pi</button>
+                </div>
+            </div>
 
-        <br><br>
-        <div class="video-container">
-            <img src="/video_feed" width="640" height="480">
-            <div class="timestamp" id="clock"></div>
+            <!-- RIGHT SIDE: Scrollable Clips -->
+            <div class="rhs-panel">
+                <h3>📁 Recent Clips</h3>
+                <ul>
+                    {clips_html}
+                </ul>
+            </div>
         </div>
-        <br><br>
-        <button onclick="fetch('/toggle').then(()=>location.reload())">Motion: {status}</button>
-        <a href="/config" class="btn">⚙️ Settings</a>
-        <a href="/videos" class="btn">📹 Recordings</a>
         
         <script>
             // Live JS Clock for Overlay
@@ -349,7 +453,7 @@ def index():
         </script>
     </body>
     </html>
-    ''')
+    '''
 
 @app.route('/config', methods=['GET', 'POST'])
 @requires_auth
