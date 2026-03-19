@@ -350,6 +350,7 @@ def view_logs():
     '''
 @app.route('/')
 def index():
+@requires_auth
     global current_brightness
     status = "ON" if MOTION_ENABLED else "OFF"
     cpu_temp, disk_free = get_sys_status()
