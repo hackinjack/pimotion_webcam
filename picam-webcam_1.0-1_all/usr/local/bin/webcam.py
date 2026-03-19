@@ -87,6 +87,7 @@ class StreamingBuffer(io.BufferedIOBase):
         self.frame = None
         self.condition = Condition()
         self.buffer = b''
+        self.last_frame_time = time.time()  # watchdog for V2L2 lock
 
     def write(self, buf):
         self.buffer += buf
@@ -104,6 +105,7 @@ class StreamingBuffer(io.BufferedIOBase):
 
             with self.condition:
                 self.frame = completed_frame
+                self.last_frame_time = time.time()  # watchdog for V2L2 lock
                 self.condition.notify_all()
 
         return len(buf)
@@ -221,6 +223,32 @@ def motion_worker():
         time.sleep(0.2)  # Throttle to ~5fps for motion analysis to save CPU
 
 threading.Thread(target=motion_worker, daemon=True).start()
+
+# ----------------------------------------------------------------------
+# Watchdog Monitor (Auto-Reboot on Camera Freeze)
+# ----------------------------------------------------------------------
+def watchdog_worker():
+    """Monitors the camera stream. If it freezes, reboots the Pi."""
+    logger.info("[WATCHDOG] Camera freeze monitor started.")
+    time.sleep(45) # Give the camera and OS plenty of time to start up initially
+
+    while True:
+        idle_time = time.time() - stream_buffer.last_frame_time
+
+        # If no new frames have arrived in 15 seconds, the V4L2 driver has crashed
+        if idle_time > 15.0:
+            logger.error(f"🚨 CAMERA FREEZE DETECTED: No frames for {idle_time:.1f}s. REBOOTING PI! 🚨")
+
+            # Issue the OS reboot command
+            os.system("sudo reboot")
+
+            # Sleep so we don't spam the reboot command while the OS shuts down
+            time.sleep(120)
+
+        time.sleep(5)
+
+threading.Thread(target=watchdog_worker, daemon=True).start()
+
 
 # ======================================================================
 # DASHBOARD LOGIC
@@ -511,15 +539,47 @@ if __name__ == '__main__':
     import gevent
     import signal
     import ssl
+    import sys
     import logging
 
     # Create a custom logger that ignores the SSLEOFError tracebacks
-    class QuietGeventLogger(logging.Logger):
-        def write(self, msg):
-            if "EOF occurred in violation of protocol" not in msg and "SSLEOFError" not in msg:
-                logger.error(msg.strip())
+    # class QuietGeventLogger(logging.Logger):
+#         def write(self, msg):
+#             if "EOF occurred in violation of protocol" not in msg and "SSLEOFError" not in msg:
+#                 logger.error(msg.strip())
 
-    quiet_logger = QuietGeventLogger("QuietGevent")
+#     quiet_logger = QuietGeventLogger("QuietGevent")
+
+
+    # --- HTTPS MAIN SERVER & ERROR SUPPRESSION ---
+    
+    # Intercept sys.stderr to filter out the Gevent greenlet SSLEOFError crashes
+    class FilteredStderr(object):
+        def __init__(self, original_stderr):
+            self.original_stderr = original_stderr
+            self.ignore_next_traceback = False
+            
+        def write(self, msg):
+            # Check if this line is the start of an SSLEOFError traceback
+            if "ssl.SSLEOFError: EOF occurred in violation of protocol" in msg:
+                self.ignore_next_traceback = True
+                return
+            elif "failed with SSLEOFError" in msg:
+                self.ignore_next_traceback = False
+                return
+                
+            # If we are currently ignoring a block, suppress standard traceback lines
+            if self.ignore_next_traceback and ("Traceback" in msg or "File" in msg or msg.startswith(" ")):
+                return
+                
+            # Otherwise, write the error normally
+            self.original_stderr.write(msg)
+            
+        def flush(self):
+            self.original_stderr.flush()
+
+    # Apply the interceptor
+    sys.stderr = FilteredStderr(sys.stderr)
 
 # Explicitly create the SSL context
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -543,7 +603,7 @@ if __name__ == '__main__':
                         app,
                         ssl_context=context
     )
-    logger.info("Flask webserver up")
+    logger.info("Flask webserver up, listening on https://0.0.0.0:{current_port}")
 
     def shutdown():
         logger.info("Shutting down... releasing camera.")
