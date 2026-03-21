@@ -11,7 +11,7 @@ A headless, high-performance motion detection security camera built specifically
 - ⚙️ **Web Config UI:** Adjust motion sensitivity, clip length, and bitrate on the fly.
 - 🛡️ **Bulletproof Streaming:** Uses `gevent` and `picamera2.StreamOutput` to ensure the camera never locks up when clients disconnect or navigate away.
 - ☁️ **Cloud Sync Ready:** Includes documentation for syncing clips to Google Drive.
-- ⚙️ **SSL:** Letsencrypt certificate generation script via the DYNU API and acme.sh .
+- ⚙️ **SSL:** Letsencrypt certificate renewal script via the DYNU API and acme.sh .
 
 ## Requirements
 
