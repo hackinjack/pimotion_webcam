@@ -47,24 +47,47 @@ for target in "${TARGETS[@]}"; do
             ;;
 
         asus)
-            # Direct copy to the Asus router's restricted filesystem and restart httpd
-            scp "${CERT_DIR}/fullchain.cer" "${user}@${host}:/etc/cert.pem"
-            scp "${CERT_DIR}/${DOMAIN}.key" "${user}@${host}:/etc/key.pem"
-            ssh "${user}@${host}" "service ${service}"
+            # Direct copy to the Asus router's restricted filesystem using ssh pipes and restart httpd
+            cat "${CERT_DIR}/fullchain.cer" | ssh "${host}" "cat > /etc/cert.pem"
+            log_info "copied cert"
+            cat "${CERT_DIR}/${DOMAIN}.key" | ssh "${host}" "cat > /etc/key.pem"
+            log_info "copied key"
+	    # Tell Asus to commit the files to NVRAM and restart the service
+ssh ${host} << 'EOF'
+nvram set https_crt_save=0
+nvram unset https_crt_file
+service restart_httpd
+sleep 5
+nvram set https_crt_save=1
+nvram commit
+EOF
+            ssh "${host}" "service restart_${service}"
+            log_info "service restarted"
             log_info "Success: ASUS deployment on $host completed."
             ;;
 
         mikrotik)
             # Set required env vars and trigger acme.sh's built-in hook
             export ROUTER_OS_USERNAME="${user}"
-            export ROUTER_OS_HOST="${host}"
-            
-            if [[ -x "$ACME_SH_BIN" ]]; then
-                "$ACME_SH_BIN" --deploy -d "${DOMAIN}" --deploy-hook "$service"
-                log_info "Success: MikroTik deployment on $host completed."
-            else
-                log_err "acme.sh binary not found at $ACME_SH_BIN or not executable."
-            fi
+            export ROUTER_OS_HOST="${host}"	# NOTE - assumes host and user set in ~/.ssh/config
+            # Push to MikroTik manually (bypassing the native hook's naming bugs)
+
+# Upload the certificate and key
+	    scp ${CERT_DIR}/fullchain.cer ${ROUTER_OS_HOST}:/fullchain.cer
+   	    scp ${CERT_DIR}/${DOMAIN}.key ${ROUTER_OS_HOST}:/privkey.key
+
+# Tell RouterOS to delete old certs, import the new ones, and assign them
+            ssh ${ROUTER_OS_HOST} << 'EOF'
+/certificate remove [find]
+/certificate import file-name=fullchain.cer passphrase=""
+/certificate import file-name=privkey.key passphrase=""
+/ip service set www-ssl certificate="fullchain.cer_0"
+/ip service disable www-ssl
+/ip service enable www-ssl
+/file remove fullchain.cer
+/file remove privkey.key
+EOF
+		log_info "Success: MikroTik deployment on $host completed."
             ;;
 
         *)
