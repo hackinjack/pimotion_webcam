@@ -350,7 +350,6 @@ def view_logs():
     '''
 @app.route('/')
 def index():
-@requires_auth
     global current_brightness
     status = "ON" if MOTION_ENABLED else "OFF"
     cpu_temp, disk_free = get_sys_status()
@@ -412,7 +411,8 @@ def index():
             <!-- LEFT SIDE: Camera & Controls -->
             <div class="camera-section">
                 <div class="video-container">
-                    <img src="/video_feed" width="640" height="480">
+                    <!-- add the ID camera_stream -->
+                    <img id="camera-stream" src="/video_feed" width="640" height="480">
                     <div class="timestamp" id="clock"></div>
                 </div>
                 
@@ -445,12 +445,22 @@ def index():
             </div>
         </div>
         
-        <script>
+            <script>
             // Live JS Clock for Overlay
             setInterval(() => {{
                 let d = new Date();
                 document.getElementById('clock').innerText = d.toISOString().replace('T', ' ').substring(0, 19);
             }}, 1000);
+
+            // Auto-reconnect MJPEG stream if the connection drops
+            const camStream = document.getElementById('camera-stream');
+            camStream.onerror = function() {{
+                console.log("Stream connection lost. Attempting to reconnect in 3 seconds...");
+                setTimeout(() => {{
+                    // Appending a timestamp prevents the browser from loading a broken cached state
+                    camStream.src = "/video_feed?" + new Date().getTime();
+                }}, 3000);
+            }};
         </script>
     </body>
     </html>
