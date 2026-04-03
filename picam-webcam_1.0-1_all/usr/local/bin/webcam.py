@@ -277,9 +277,14 @@ def gen_frames():
             frame = stream_buffer.frame
             
         if frame is not None:
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-
+            try:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            except Exception as e:
+                # If the browser closes the connection (auto-refresh, navigating away, etc.), 
+                # the write will fail. Catch it and gracefully terminate the stream generator.
+                logger.info(f"[STREAM] Client disconnected gracefully.")
+                break
 # ======================================================================
 # BASIC AUTHENTICATION
 # ======================================================================
@@ -350,7 +355,6 @@ def view_logs():
     '''
 @app.route('/')
 def index():
-@requires_auth
     global current_brightness
     status = "ON" if MOTION_ENABLED else "OFF"
     cpu_temp, disk_free = get_sys_status()
@@ -412,7 +416,8 @@ def index():
             <!-- LEFT SIDE: Camera & Controls -->
             <div class="camera-section">
                 <div class="video-container">
-                    <img src="/video_feed" width="640" height="480">
+                    <!-- add the ID camera_stream -->
+                    <img id="camera-stream" src="/video_feed" width="640" height="480">
                     <div class="timestamp" id="clock"></div>
                 </div>
                 
@@ -424,6 +429,7 @@ def index():
                 
                 <div class="btn-group">
                     <button class="btn-default" onclick="fetch('/toggle').then(()=>location.reload())">🏃 Motion: {status}</button>
+                    <button class="btn-default" onclick="document.getElementById('camera-stream').src='/video_feed?' + new Date().getTime()">🔄 Reload Video</button>
                     <a href="/config" class="btn btn-default">⚙️ Settings</a>
                     <a href="/videos" class="btn btn-default">📹 All Videos</a>
                     <a href="{GDRIVE_URL}" target="_blank" class="btn btn-gdrive">☁️ GDrive</a>
@@ -445,12 +451,27 @@ def index():
             </div>
         </div>
         
-        <script>
+            <script>
             // Live JS Clock for Overlay
             setInterval(() => {{
                 let d = new Date();
                 document.getElementById('clock').innerText = d.toISOString().replace('T', ' ').substring(0, 19);
             }}, 1000);
+
+            // Auto-reconnect MJPEG stream if the connection drops
+            const camStream = document.getElementById('camera-stream');
+            camStream.onerror = function() {{
+                console.log("Stream connection lost. Attempting to reconnect in 3 seconds...");
+                setTimeout(() => {{
+                    // Appending a timestamp prevents the browser from loading a broken cached state
+                    camStream.src = "/video_feed?" + new Date().getTime();
+                }}, 3000);
+            }};
+            // Proactively refresh the stream every 10 minutes to defeat silent router TCP timeouts
+            setInterval(() => {{
+                console.log("Proactively refreshing stream...");
+                camStream.src = "/video_feed?" + new Date().getTime();
+            }}, 600000); // 600,000 ms = 10 minutes
         </script>
     </body>
     </html>
@@ -635,89 +656,76 @@ def download(filename):
     return send_from_directory(RECORDING_DIR, filename, as_attachment=True, download_name=filename)
 
 if __name__ == '__main__':
-    # Important: Load config FIRST to ensure we get the saved WEB_PORT
     load_config()
-    current_port = config_data.get("WEB_PORT", 8773)
+    current_port = config_data.get("WEB_PORT", 5000)
+    http_port = current_port + 1
 
-    logger.info(f"PiCam Motion Webcam (Gevent mode) starting on https://0.0.0.0:{current_port}")
+    logger.info(f"PiCam Motion Webcam (Gevent mode) starting on https://[::]:{current_port}")
+    logger.info(f"HTTP Redirect Server starting on http://[::]:{http_port}")
+
     from gevent.pywsgi import WSGIServer
-    import gevent
+    import gevent.hub
     import signal
     import ssl
-    import sys
-    import logging
 
-    # Create a custom logger that ignores the SSLEOFError tracebacks
-    # class QuietGeventLogger(logging.Logger):
-#         def write(self, msg):
-#             if "EOF occurred in violation of protocol" not in msg and "SSLEOFError" not in msg:
-#                 logger.error(msg.strip())
+    # --- TELL GEVENT TO COMPLETELY IGNORE SSLEOFError ---
+    # This prevents the core event loop from printing tracebacks when a browser
+    # forcefully drops an SSL connection mid-download.
+    gevent.hub.Hub.NOT_ERROR = gevent.hub.Hub.NOT_ERROR + (ssl.SSLEOFError,)
 
-#     quiet_logger = QuietGeventLogger("QuietGevent")
+    # --- HTTP REDIRECT SERVER ---
+    def redirect_app(environ, start_response):
+        host = environ.get('HTTP_HOST', '')
+        if ':' in host:
+            domain = host.split(':')[0]
+            target_host = f"{domain}:{current_port}"
+        else:
+            target_host = f"{host}:{current_port}" if current_port != 443 else host
 
+        path = environ.get('PATH_INFO', '/')
+        query = environ.get('QUERY_STRING', '')
+        if query:
+            path += f"?{query}"
 
-    # --- HTTPS MAIN SERVER & ERROR SUPPRESSION ---
-    
-    # Intercept sys.stderr to filter out the Gevent greenlet SSLEOFError crashes
-    class FilteredStderr(object):
-        def __init__(self, original_stderr):
-            self.original_stderr = original_stderr
-            self.ignore_next_traceback = False
-            
-        def write(self, msg):
-            # Check if this line is the start of an SSLEOFError traceback
-            if "ssl.SSLEOFError: EOF occurred in violation of protocol" in msg:
-                self.ignore_next_traceback = True
-                return
-            elif "failed with SSLEOFError" in msg:
-                self.ignore_next_traceback = False
-                return
-                
-            # If we are currently ignoring a block, suppress standard traceback lines
-            if self.ignore_next_traceback and ("Traceback" in msg or "File" in msg or msg.startswith(" ")):
-                return
-                
-            # Otherwise, write the error normally
-            self.original_stderr.write(msg)
-            
-        def flush(self):
-            self.original_stderr.flush()
+        redirect_url = f"https://{target_host}{path}"
 
-    # Apply the interceptor
-    sys.stderr = FilteredStderr(sys.stderr)
+        start_response('301 Moved Permanently', [
+            ('Location', redirect_url),
+            ('Content-Type', 'text/plain')
+        ])
+        return [b"Redirecting to HTTPS..."]
 
-# Explicitly create the SSL context
+    redirect_server = WSGIServer(('::', http_port), redirect_app)
+    gevent.spawn(redirect_server.serve_forever)
+
+    # --- HTTPS MAIN SERVER ---
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    logger.info("SSL context created")
-    
+
     try:
-        # Load your Let's Encrypt certificates
         context.load_cert_chain(
             keyfile='/etc/letsencrypt/live/picam1.thirteenb.mywire.org/privkey.pem',
             certfile='/etc/letsencrypt/live/picam1.thirteenb.mywire.org/fullchain.pem'
-            )
-    except PermissionError:
-        logger.error("CRITICAL: Python does not have permission to read the Let's Encrypt certificates!")
-        exit(1)
+        )
     except Exception as e:
         logger.error(f"CRITICAL: SSL Context failed to load: {e}")
-        exit(1)    
-# Pass the context directly to the WSGIServer
-    logger.info("Starting up")
-    server = WSGIServer(('::', 8773), 
+        exit(1)
+
+    server = WSGIServer(('::', current_port),
                         app,
                         ssl_context=context
     )
-    logger.info("Flask webserver up, listening on https://0.0.0.0:{current_port}")
+
+    logger.info("Webservers are fully initialized.")
 
     def shutdown():
         logger.info("Shutting down... releasing camera.")
         server.stop()
+        redirect_server.stop()
         try:
             camera.stop()
             camera.close()
-        except Exception as e:
-            logger.error(f"Error closing camera: {e}")
+        except Exception:
+            pass
 
     gevent.signal_handler(signal.SIGTERM, shutdown)
     gevent.signal_handler(signal.SIGINT, shutdown)
@@ -728,4 +736,99 @@ if __name__ == '__main__':
         pass
     finally:
         shutdown()
+
+# if __name__ == '__main__':
+#     # Important: Load config FIRST to ensure we get the saved WEB_PORT
+#     load_config()
+#     current_port = config_data.get("WEB_PORT", 8773)
+# 
+#     logger.info(f"PiCam Motion Webcam (Gevent mode) starting on https://0.0.0.0:{current_port}")
+#     from gevent.pywsgi import WSGIServer
+#     import gevent
+#     import signal
+#     import ssl
+#     import sys
+#     import logging
+# 
+#     # Create a custom logger that ignores the SSLEOFError tracebacks
+#     # class QuietGeventLogger(logging.Logger):
+# #         def write(self, msg):
+# #             if "EOF occurred in violation of protocol" not in msg and "SSLEOFError" not in msg:
+# #                 logger.error(msg.strip())
+# 
+# #     quiet_logger = QuietGeventLogger("QuietGevent")
+# 
+# 
+#     # --- HTTPS MAIN SERVER & ERROR SUPPRESSION ---
+#     
+#     # Intercept sys.stderr to filter out the Gevent greenlet SSLEOFError crashes
+#     class FilteredStderr(object):
+#         def __init__(self, original_stderr):
+#             self.original_stderr = original_stderr
+#             self.ignore_next_traceback = False
+#             
+#         def write(self, msg):
+#             # Check if this line is the start of an SSLEOFError traceback
+#             if "ssl.SSLEOFError: EOF occurred in violation of protocol" in msg:
+#                 self.ignore_next_traceback = True
+#                 return
+#             elif "failed with SSLEOFError" in msg:
+#                 self.ignore_next_traceback = False
+#                 return
+#                 
+#             # If we are currently ignoring a block, suppress standard traceback lines
+#             if self.ignore_next_traceback and ("Traceback" in msg or "File" in msg or msg.startswith(" ")):
+#                 return
+#                 
+#             # Otherwise, write the error normally
+#             self.original_stderr.write(msg)
+#             
+#         def flush(self):
+#             self.original_stderr.flush()
+# 
+#     # Apply the interceptor
+#     sys.stderr = FilteredStderr(sys.stderr)
+# 
+# # Explicitly create the SSL context
+#     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+#     logger.info("SSL context created")
+#     
+#     try:
+#         # Load your Let's Encrypt certificates
+#         context.load_cert_chain(
+#             keyfile='/etc/letsencrypt/live/picam1.thirteenb.mywire.org/privkey.pem',
+#             certfile='/etc/letsencrypt/live/picam1.thirteenb.mywire.org/fullchain.pem'
+#             )
+#     except PermissionError:
+#         logger.error("CRITICAL: Python does not have permission to read the Let's Encrypt certificates!")
+#         exit(1)
+#     except Exception as e:
+#         logger.error(f"CRITICAL: SSL Context failed to load: {e}")
+#         exit(1)    
+# # Pass the context directly to the WSGIServer
+#     logger.info("Starting up")
+#     server = WSGIServer(('::', 8773), 
+#                         app,
+#                         ssl_context=context
+#     )
+#     logger.info("Flask webserver up, listening on https://0.0.0.0:{current_port}")
+# 
+#     def shutdown():
+#         logger.info("Shutting down... releasing camera.")
+#         server.stop()
+#         try:
+#             camera.stop()
+#             camera.close()
+#         except Exception as e:
+#             logger.error(f"Error closing camera: {e}")
+# 
+#     gevent.signal_handler(signal.SIGTERM, shutdown)
+#     gevent.signal_handler(signal.SIGINT, shutdown)
+# 
+#     try:
+#         server.serve_forever()
+#     except KeyboardInterrupt:
+#         pass
+#     finally:
+#         shutdown()
 
