@@ -53,6 +53,7 @@ config_data = {
     "VIDEO_BITRATE": 10000000,
     "MOTION_ENABLED": True,
     "WEB_PORT": 8773,
+    "RETENTION_DAYS": 3,  # <-- (0 disables auto-delete)
     "AUTH_USERNAME": "admin",
     "AUTH_PASSWORD_HASH": "pbkdf2:sha256:150000$8vt9qhg9NVcrgXpW$fc93fd73bd1a1b2be69525c3b0c514a6e2e18105b61b2af903b3e2edd11b7652"
 }
@@ -133,6 +134,43 @@ logger.info("Camera initialized and streaming.")
 prev_gray = None
 is_recording = False
 recording_lock = Lock()
+
+# ----------------------------------------------------------------------
+# Disk Cleanup Worker (Auto-delete old clips)
+# ----------------------------------------------------------------------
+def cleanup_worker():
+    """Runs periodically to delete video clips older than RETENTION_DAYS."""
+    logger.info("[CLEANUP] Disk cleanup worker started.")
+    time.sleep(60) # Wait a minute after boot before scanning
+
+    while True:
+        try:
+            with config_lock:
+                retention_days = config_data.get("RETENTION_DAYS", 3)
+
+            if retention_days > 0:
+                now = time.time()
+                cutoff_time = now - (retention_days * 86400) # Convert days to seconds
+                deleted_count = 0
+
+                for filename in os.listdir(RECORDING_DIR):
+                    if filename.endswith('.mp4'):
+                        path = os.path.join(RECORDING_DIR, filename)
+                        # Check if the file's modification time is older than the cutoff
+                        if os.path.getmtime(path) < cutoff_time:
+                            os.remove(path)
+                            deleted_count += 1
+
+                if deleted_count > 0:
+                    logger.info(f"[CLEANUP] Automatically deleted {deleted_count} old video clips.")
+
+        except Exception as e:
+            logger.error(f"[CLEANUP] Error during disk cleanup: {e}")
+
+        # Sleep for 6 hours before checking the disk again
+        time.sleep(21600)
+
+threading.Thread(target=cleanup_worker, daemon=True).start()
 
 def start_recording():
     global is_recording
@@ -536,6 +574,7 @@ def config():
             config_data["MOTION_THRESHOLD"] = int(request.form.get('sensitivity', config_data["MOTION_THRESHOLD"]))
             config_data["CLIP_SECONDS"] = int(request.form.get('clip_length', config_data["CLIP_SECONDS"]))
             config_data["VIDEO_BITRATE"] = int(request.form.get('bitrate', config_data["VIDEO_BITRATE"]))
+            config_data["RETENTION_DAYS"] = int(request.form.get('retention_days', config_data.get("RETENTION_DAYS", 3)))
             config_data["WEB_PORT"] = int(request.form.get('web_port', config_data.get("WEB_PORT", 8773)))
             
             # Handle credential updates if provided
@@ -579,6 +618,9 @@ def config():
             <p><b>Clip Length (sec):</b> {config_data["CLIP_SECONDS"]}<br>
             <input type="range" name="clip_length" min="5" max="60" step="5" value="{config_data["CLIP_SECONDS"]}" style="width:300px"></p>
             <p><b>Bitrate (bps):</b> {config_data["VIDEO_BITRATE"]}<br>
+                        <p><b>Video Retention (Days):</b> {config_data.get("RETENTION_DAYS", 3)}<br>
+            <input type="number" name="retention_days" min="0" max="30" value="{config_data.get("RETENTION_DAYS", 3)}" style="width:150px">
+            <br><i style="font-size:12px; color:#555;">Set to 0 to disable auto-delete</i></p>
             <hr>
             <h3>Network Settings</h3>
             <p><b>Web UI Port:</b><br>
