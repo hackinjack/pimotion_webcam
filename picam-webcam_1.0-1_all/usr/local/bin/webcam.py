@@ -256,15 +256,34 @@ threading.Thread(target=watchdog_worker, daemon=True).start()
 current_brightness = 100 # Placeholder for Stage 3
 
 def get_sys_status():
-    """Gets CPU Temp and Disk Space for dashboard."""
+    """Gets CPU Temp and Disk Space, CPU load and RAM usage for dashboard."""
     try:
         temp = os.popen("vcgencmd measure_temp").readline().strip().replace("temp=","")
     except:
         temp = "N/A"
     total, used, free = shutil.disk_usage("/")
     free_gb = free // (2**30)
-    return temp, free_gb
-
+    
+    try:
+        # Get 1-minute load average
+        load = round(os.getloadavg()[0], 2)
+    except:
+        load = "N/A"
+        
+    try:
+        # Calculate RAM usage percentage
+        meminfo = {}
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                parts = line.split()
+                meminfo[parts[0].strip(':')] = int(parts[1])
+        total_mem = meminfo.get('MemTotal', 1)
+        avail_mem = meminfo.get('MemAvailable', meminfo.get('MemFree', 0))
+        mem_usage = f"{int(((total_mem - avail_mem) / total_mem) * 100)}%"
+    except Exception:
+        mem_usage = "N/A"
+        
+    return temp, free_gb, load, mem_usage
 # ----------------------------------------------------------------------
 # 4. Flask Web Routes
 # ----------------------------------------------------------------------
@@ -357,7 +376,7 @@ def view_logs():
 def index():
     global current_brightness
     status = "ON" if MOTION_ENABLED else "OFF"
-    cpu_temp, disk_free = get_sys_status()
+    cpu_temp, disk_free, cpu_load, mem_usage = get_sys_status()
     
     # Generate the HTML for the scrollable recent clips (last 25 clips)
     clips_html = ""
@@ -365,14 +384,12 @@ def index():
         recent_files = sorted(os.listdir(RECORDING_DIR), reverse=True)[:25]
         for f in recent_files:
             if f.endswith('.mp4'):
-                # Creates a neat downloadable link for each clip
                 clips_html += f'<li style="margin-bottom: 8px; font-family: monospace;"><a href="/download/{f}" style="color: #4CAF50; text-decoration: none;">▶ {f}</a></li>'
         if not clips_html:
             clips_html = "<li style='color: #aaa;'>No clips found.</li>"
     except Exception:
         clips_html = "<li style='color: red;'>Error reading directory</li>"
 
-    # NOTE: Replace the GDrive URL below with your actual shared Drive link
     GDRIVE_URL = "https://drive.google.com/drive/my-drive"
 
     return f'''
@@ -388,7 +405,7 @@ def index():
             .camera-section {{ display: flex; flex-direction: column; align-items: center; }}
             
             /* Video and Status */
-            .video-container {{ position: relative; display: inline-block; border: 3px solid #444; border-radius: 8px; overflow: hidden; }}
+            .video-container {{ position: relative; display: inline-block; border: 3px solid #444; border-radius: 8px; overflow: hidden; background: #000; min-width: 640px; min-height: 480px; }}
             .timestamp {{ position: absolute; bottom: 10px; right: 15px; color: yellow; font-size: 20px; font-weight: bold; background: rgba(0,0,0,0.5); padding: 2px 8px; border-radius: 4px; font-family: monospace; }}
             .status-bar {{ background: #333; padding: 10px 20px; border-radius: 5px; margin: 15px 0; display: inline-block; font-size: 14px; color: #aaa; border: 1px solid #444; }}
             .status-bar b {{ color: #fff; }}
@@ -416,26 +433,29 @@ def index():
             <!-- LEFT SIDE: Camera & Controls -->
             <div class="camera-section">
                 <div class="video-container">
-                    <!-- add the ID camera_stream -->
                     <img id="camera-stream" src="/video_feed" width="640" height="480">
                     <div class="timestamp" id="clock"></div>
                 </div>
                 
                 <div class="status-bar">
                     🌡️ Temp: <b>{cpu_temp}</b> &nbsp;|&nbsp; 
+                    ⚙️ Load: <b>{cpu_load}</b> &nbsp;|&nbsp;
+                    🧠 RAM: <b>{mem_usage}</b> &nbsp;|&nbsp;
                     💾 SD Free: <b>{disk_free} GB</b> &nbsp;|&nbsp; 
                     ☀️ Light: <b>{int(current_brightness)}/255</b>
                 </div>
                 
                 <div class="btn-group">
                     <button class="btn-default" onclick="fetch('/toggle').then(()=>location.reload())">🏃 Motion: {status}</button>
-                    <button class="btn-default" onclick="document.getElementById('camera-stream').src='/video_feed?' + new Date().getTime()">🔄 Reload Video</button>
+                    <!-- NEW PREVIEW TOGGLE BUTTON -->
+                    <button class="btn-default" id="preview-btn" onclick="togglePreview()">👁️ Preview: ON</button>
+                    <button class="btn-default" onclick="if(previewActive) document.getElementById('camera-stream').src='/video_feed?' + new Date().getTime()">🔄 Reload</button>
                     <a href="/config" class="btn btn-default">⚙️ Settings</a>
                     <a href="/videos" class="btn btn-default">📹 All Videos</a>
-                    <a href="{GDRIVE_URL}" target="_blank" class="btn btn-gdrive">☁️ GDrive</a>
                 </div>
                 
                 <div class="btn-group" style="border-top: 1px solid #444; padding-top: 15px;">
+                    <a href="{GDRIVE_URL}" target="_blank" class="btn btn-gdrive">☁️ GDrive</a>
                     <a href="/logs" class="btn btn-log">📜 View Logs</a>
                     <button class="btn-warn" onclick="if(confirm('Restart camera service? This takes 10 seconds.')) window.location.href='/sys_cmd/restart_cam'">🔄 Restart Service</button>
                     <button class="btn-danger" onclick="if(confirm('Are you sure you want to REBOOT the Pi?')) window.location.href='/sys_cmd/reboot'">🔴 Reboot Pi</button>
@@ -451,27 +471,54 @@ def index():
             </div>
         </div>
         
-            <script>
+        <script>
             // Live JS Clock for Overlay
             setInterval(() => {{
                 let d = new Date();
                 document.getElementById('clock').innerText = d.toISOString().replace('T', ' ').substring(0, 19);
             }}, 1000);
 
-            // Auto-reconnect MJPEG stream if the connection drops
+            // --- NEW PREVIEW TOGGLE LOGIC ---
+            let previewActive = true;
+            // 1x1 transparent GIF to cleanly drop the stream connection
+            const blankImg = "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";
+
+            function togglePreview() {{
+                const camStream = document.getElementById('camera-stream');
+                const btn = document.getElementById('preview-btn');
+                
+                if (previewActive) {{
+                    camStream.src = blankImg;
+                    btn.innerHTML = "👁️ Preview: OFF";
+                    btn.style.background = "#FF9800"; // Orange when paused
+                    btn.style.color = "white";
+                    previewActive = false;
+                }} else {{
+                    camStream.src = "/video_feed?" + new Date().getTime();
+                    btn.innerHTML = "👁️ Preview: ON";
+                    btn.style.background = "#ddd"; // Back to default
+                    btn.style.color = "black";
+                    previewActive = true;
+                }}
+            }}
+
+            // Auto-reconnect MJPEG stream if the connection drops explicitly
             const camStream = document.getElementById('camera-stream');
             camStream.onerror = function() {{
+                if (!previewActive) return; // Don't reconnect if manually paused
                 console.log("Stream connection lost. Attempting to reconnect in 3 seconds...");
                 setTimeout(() => {{
-                    // Appending a timestamp prevents the browser from loading a broken cached state
-                    camStream.src = "/video_feed?" + new Date().getTime();
+                    if (previewActive) camStream.src = "/video_feed?" + new Date().getTime();
                 }}, 3000);
             }};
+
             // Proactively refresh the stream every 10 minutes to defeat silent router TCP timeouts
             setInterval(() => {{
-                console.log("Proactively refreshing stream...");
-                camStream.src = "/video_feed?" + new Date().getTime();
-            }}, 600000); // 600,000 ms = 10 minutes
+                if (previewActive) {{
+                    console.log("Proactively refreshing stream...");
+                    camStream.src = "/video_feed?" + new Date().getTime();
+                }}
+            }}, 600000);
         </script>
     </body>
     </html>
@@ -506,23 +553,25 @@ def config():
         if not update_msg:
             update_msg = "<p style='color:green; font-weight:bold;'>Settings Saved Successfully!</p>"
     
-    cpu_temp, disk_free = get_sys_status()
+    cpu_temp, disk_free, cpu_load, mem_usage = get_sys_status()
     current_port = config_data.get("WEB_PORT", 5000)
-    
+
     html = f'''
     <!DOCTYPE html><html><head><title>Config</title><style>body{{font-family:Arial; margin:40px}}</style></head>
     <body>
         <h1>⚙️ Dashboard & Config</h1>
         <a href="/">🏠 Live View</a><hr>
         {update_msg}
-        
+
         <div style="background:#eee; color:black; padding:15px; border-radius:8px; margin-bottom:20px; width:400px;">
             <h3>📊 System Status</h3>
             <b>CPU Temp:</b> {cpu_temp}<br>
+            <b>CPU Load:</b> {cpu_load}<br>
+            <b>RAM Usage:</b> {mem_usage}<br>
             <b>SD Card Free:</b> {disk_free} GB<br>
             <b>Light Level:</b> {int(current_brightness)}/255<br>
         </div>
-
+        
         <form method="POST">
             <h3>Camera Settings</h3>
             <p><b>Sensitivity (Threshold):</b> {config_data["MOTION_THRESHOLD"]}<br>
